@@ -153,19 +153,6 @@ signatures vs summary stats on ROC-AUC, PR-AUC, AD1–AD4 *and* F1 on identical 
 
 ---
 
-## 7. Multi-seed whatever you quote
-
-**What.** Every number produced so far is a single seed.
-
-**Why.** The ridge sweep showed adjacent settings swinging by ±0.05 where they should have behaved
-near-identically — FD001 went 0.659 → 0.446 → 0.592 across γ = 0.1, 0.3, 0.5. **Differences below
-about 0.02 cannot be resolved at one seed**, and several effects of interest are that size.
-
-**How.** ≥3 values of `calibrate.random_state`, report mean ± spread. Only for the numbers that go
-in the write-up — not the whole ablation grid.
-
----
-
 ## 8. Run the throughput sweeps
 
 **What.** The instrumentation is built; no measurements have been taken.
