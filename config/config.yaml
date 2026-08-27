@@ -789,7 +789,16 @@ evaluate:
     # thresholds are a table, not a scalar, so a sweep has to pick a path through that space -
     # and it is the natural one. 1.0 is the calibrated setting itself, so the deployed operating
     # point appears on the same curve as the hypothetical ones.
-    scales: [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 10.0]
+    # Trimmed from [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 10.0] on measured evidence. The extremes buy
+    # nothing: at 0.1 and 0.25 the detector flagged 100% and 96.7% of FD001, which is the (1, 1)
+    # corner, and at 10.0 it flagged 0.46%, which is (0, 0). `operating_point_auc` anchors at
+    # both corners for free - they are limits of the detector, not measurements - so those three
+    # runs cost a full search each and moved the area not at all.
+    #
+    # What is left spans the region where the curve actually bends, which is where a trapezoid
+    # through sampled points is least accurate and an extra sample is worth most. Four searches
+    # per subset instead of seven, roughly 45% less of the run.
+    scales: [0.5, 1.0, 2.0, 4.0]
   # Also draw streams with nothing flagged. Off by default: on a run of any size they are the
   # overwhelming majority, and a directory of flat lines buries the few plots worth looking
   # at. Turn on when the clean streams are the point - checking for false negatives.
