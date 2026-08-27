@@ -178,6 +178,16 @@ if METRIC_FILE_FORMAT not in ("npz", "csv"):
         "metric.file_format is {0!r}; expected 'npz' or 'csv'. Note this is not metric.form, "
         "which chooses between pinv and inv_sqrt.".format(METRIC_FILE_FORMAT))
 COVARIANCE = "data/corpus/{{dataset}}_covariance.{0}".format(METRIC_FILE_FORMAT)
+
+#: Whether the metric is stored as its rank-r factor and searched in r latent coordinates
+#: rather than D signature terms. Exact - the projection is an isometry - and worth r/D of the
+#: index memory and search cost. Only `npz` can carry a factor; csv falls back to the dense form.
+FACTORED_METRIC = bool(config["metric"].get("factored", False))
+if FACTORED_METRIC and METRIC_FILE_FORMAT != "npz":
+    raise WorkflowError(
+        "metric.factored is true but metric.file_format is {0!r}. The factor is two arrays and "
+        "only npz carries it; a csv would have to store the matrix multiplied out, which is the "
+        "thing being avoided. Use npz, or set factored to false.".format(METRIC_FILE_FORMAT))
 COVARIANCE_DIAGNOSTICS = "data/corpus/{dataset}_covariance.json"
 #: An orthonormal basis of the corpus's numerically non-zero row space - a few hundred
 #: directions, not the eleven `variance_keep` retains. Only the off-manifold test reads it, and
@@ -876,6 +886,10 @@ rule covariance:
             form=config["metric"]["form"],
             diagnostics_path=output.diagnostics,
             subspace_path=output.subspace,
+            # Store the rank-r factor rather than the dense matrix, and let every stage
+            # downstream work in r latent coordinates. Exact, not approximate: the projection is
+            # an isometry, which this asserts before writing.
+            factored=FACTORED_METRIC,
             show_progress=True,
         )
 

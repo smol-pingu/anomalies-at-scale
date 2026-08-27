@@ -48,7 +48,7 @@ import numpy as np
 import pandas as pd
 
 from anomalies_scale.covariance_creation import (
-    load_covariance, read_corpus, signature_matrix)
+    Whitening, load_whitening, read_corpus, signature_matrix)
 from anomalies_scale.threshold_calibration import parse_statistic
 
 #: Column identifying which stream an interval came from - what the folds are drawn over.
@@ -207,10 +207,13 @@ def crossvalidated_thresholds(corpora, covariance, k=5, statistic="p99", band=1,
 
     signatures, columns = signature_matrix(frame)
     if isinstance(covariance, (str, Path)):
-        covariance = load_covariance(covariance, expected_columns=columns)
-    covariance = np.asarray(covariance, dtype=float)
+        covariance = load_whitening(covariance, expected_columns=columns)
+    elif not isinstance(covariance, Whitening):
+        covariance = Whitening.from_dense(np.asarray(covariance, dtype=float))
 
-    whitened = np.ascontiguousarray(signatures @ covariance.T, dtype="float32")
+    # `apply` returns the latent coordinates when the metric is factored - r columns rather than
+    # D - and distances between them are the same numbers, so the folds below are unaffected.
+    whitened = np.ascontiguousarray(covariance.apply(signatures), dtype="float32")
     depths = frame["depth"].to_numpy(dtype=int)
     streams = frame[STREAM_COLUMN].to_numpy()
     if windowed:

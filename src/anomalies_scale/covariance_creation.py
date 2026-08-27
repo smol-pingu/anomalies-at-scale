@@ -84,8 +84,13 @@ CORPUS_READERS = {
 MATRIX_FORMATS = (".npz", ".csv")
 
 
-def write_covariance(labelled, output_path):
+def write_covariance(labelled, output_path, whitening=None):
     """Write a fitted matrix, dispatching on the output path's suffix.
+
+    Given a `whitening` with its factor, writes ``basis`` and ``scale`` instead of ``matrix`` -
+    7,150 numbers rather than 422,500 on C-MAPSS, and the form `load_covariance` needs to index
+    in latent coordinates. Only ``npz`` can carry it; a csv request falls back to the dense
+    matrix, since a labelled table of the factor would not be the readable thing csv is for.
 
     ``np.savez`` rather than ``savez_compressed``: the matrix is dense float64 with little
     structure for zlib to find, so compression buys around a tenth of the size and costs CPU on
@@ -104,6 +109,11 @@ def write_covariance(labelled, output_path):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     if suffix == ".csv":
         labelled.to_csv(output_path)
+    elif whitening is not None and whitening.factored:
+        np.savez(output_path,
+                 basis=whitening.basis.astype(np.float64),
+                 scale=whitening.scale.astype(np.float64),
+                 columns=np.asarray(labelled.columns, dtype=str))
     else:
         np.savez(output_path, matrix=labelled.to_numpy(dtype=np.float64),
                  columns=np.asarray(labelled.columns, dtype=str))
@@ -241,6 +251,96 @@ def numerical_subspace(signatures, rcond=1e-12):
     return right[:rank]
 
 
+class Whitening:
+    """The fitted metric, as either a dense matrix or the rank-r factor behind it.
+
+    ``covariance_matrix`` builds the whitening as ``W = V_r.T diag(s) V_r`` with ``V_r`` of
+    shape ``(r, D)`` and orthonormal rows, then multiplies it out into a ``D x D`` array. On
+    C-MAPSS that is a 650 x 650 matrix of rank 8 to 11 - 422,500 numbers expressing something
+    that needs 7,150.
+
+    Keeping the factor is not only smaller. Because ``V_r`` has orthonormal rows, the latent
+    coordinates ``z = x V_r.T diag(s)`` are an **exact isometry** of the whitened vectors::
+
+        x_w = z V_r          =>      ||x_w - y_w||^2
+                                       = (z_x - z_y) V_r V_r.T (z_x - z_y).T
+                                       = ||z_x - z_y||^2                 since V_r V_r.T = I_r
+
+    So a FAISS index over *r* coordinates returns identical neighbours and identical distances
+    to one over *D*, at r/D of the memory and the search cost. On FD001 that is 76.1 MB of index
+    against 1.29 MB; on FD004, 240 MB against 4 MB. The claim is exact rather than approximate,
+    and is asserted in `latent_isometry_error` rather than taken on trust.
+
+    ``dense`` reconstructs the ``D x D`` form for the one caller that genuinely needs it -
+    `index_creation.check_is_whitening`, which tests that whitening leaves the corpus covariance
+    a projection and so has to see the matrix itself.
+    """
+
+    def __init__(self, basis, scale, columns=None, matrix=None):
+        #: ``(r, D)`` orthonormal rows, or None when only a dense matrix is held.
+        self.basis = None if basis is None else np.asarray(basis, dtype=float)
+        self.scale = None if scale is None else np.asarray(scale, dtype=float)
+        self._matrix = None if matrix is None else np.asarray(matrix, dtype=float)
+        self.columns = list(columns) if columns is not None else None
+        if self.basis is None and self._matrix is None:
+            raise ValueError("a Whitening needs either a factor or a dense matrix")
+
+    @classmethod
+    def from_dense(cls, matrix, columns=None):
+        """Wrap a matrix that was stored densely - every artifact written before the factor."""
+        return cls(None, None, columns, matrix)
+
+    @property
+    def factored(self):
+        return self.basis is not None
+
+    @property
+    def dimension(self):
+        """Signature terms the metric was fitted on - *D*, never the latent width.
+
+        Distinct from `latent` on purpose: `stream_scoring` infers the truncation level from the
+        number of signature terms, and would infer the wrong one from a latent width.
+        """
+        return int(self.basis.shape[1] if self.factored else self._matrix.shape[0])
+
+    @property
+    def latent(self):
+        """Columns `apply` returns - *r* when factored, *D* when dense."""
+        return int(self.basis.shape[0] if self.factored else self._matrix.shape[0])
+
+    def apply(self, signatures):
+        """Put signature vectors into the space distances are measured in."""
+        signatures = np.atleast_2d(np.asarray(signatures, dtype=float))
+        if not self.factored:
+            return signatures @ self._matrix.T
+        return (signatures @ self.basis.T) * self.scale
+
+    def dense(self):
+        """The ``D x D`` matrix, reconstructed from the factor if that is what is held."""
+        if self._matrix is None:
+            self._matrix = (self.basis.T * self.scale) @ self.basis
+        return self._matrix
+
+    def latent_isometry_error(self, signatures, sample=200, random_state=0):
+        """Largest relative disagreement between latent and full-width distances.
+
+        The whole justification for indexing *r* coordinates instead of *D*. Checked rather than
+        assumed, on a sample, because a silent failure here would produce plausible distances in
+        the wrong geometry - the same class of error `check_is_whitening` exists to catch.
+        """
+        if not self.factored:
+            return 0.0
+        rows = np.random.default_rng(random_state).choice(
+            len(signatures), size=min(int(sample), len(signatures)), replace=False)
+        block = np.asarray(signatures, dtype=float)[rows]
+        latent = self.apply(block)
+        full = block @ self.dense().T
+        near = np.linalg.norm(latent[:, None] - latent[None], axis=-1)
+        far = np.linalg.norm(full[:, None] - full[None], axis=-1)
+        scale = float(far.max())
+        return float(np.abs(near - far).max() / scale) if scale else 0.0
+
+
 def covariance_matrix(signatures, variance_keep=0.999, form="pinv"):
     """Fit the covariance of `signatures` and return the requested inverse form.
 
@@ -275,6 +375,7 @@ def covariance_matrix(signatures, variance_keep=0.999, form="pinv"):
 
     kept = right[:rank]
     matrix = (kept.T * scale) @ kept
+    factor = Whitening(kept, scale, matrix=matrix)
 
     energy = float(np.sum(values[:rank] ** 2) / np.sum(values ** 2))
     diagnostics = {
@@ -285,11 +386,15 @@ def covariance_matrix(signatures, variance_keep=0.999, form="pinv"):
         "variance_retained": energy,
         "condition_number": float(values[0] / values[rank - 1]),
     }
+    # The dense matrix stays the return value, so every existing caller is unaffected. The
+    # factor rides along on it for the ones that want to index in latent coordinates.
+    diagnostics["whitening"] = factor
     return matrix, diagnostics
 
 
 def create_covariance(corpus, output_path=None, variance_keep=0.999, form="pinv",
-                      diagnostics_path=None, subspace_path=None, show_progress=False):
+                      diagnostics_path=None, subspace_path=None, factored=False,
+                      show_progress=False):
     """Fit the metric for one corpus and write it as a CSV matrix.
 
     The CSV carries the signature term names as both its header and its index, so the matrix
@@ -334,11 +439,35 @@ def create_covariance(corpus, output_path=None, variance_keep=0.999, form="pinv"
         print("fitted {form} on {n_intervals:,} intervals x {dimension} terms: rank "
               "{rank}, retaining {variance_retained:.4%} of variance".format(**info))
 
+    whitening = info.pop("whitening")
+    whitening.columns = list(columns)
+
+    if factored:
+        # The claim the latent index rests on, measured rather than assumed: distances between
+        # r-dimensional coordinates must equal distances between D-dimensional whitened vectors.
+        info["latent_dimension"] = int(whitening.latent)
+        info["latent_isometry_error"] = whitening.latent_isometry_error(signatures)
+        if info["latent_isometry_error"] > 1e-6:
+            raise ValueError(
+                "the rank-{0} factor does not reproduce full-width distances (relative error "
+                "{1:.2e}). Something is wrong with the decomposition; refusing to index in a "
+                "geometry that is not the one the metric describes."
+                .format(whitening.latent, info["latent_isometry_error"]))
+
     if output_path is not None:
-        output_path = write_covariance(labelled, output_path)
+        output_path = write_covariance(labelled, output_path,
+                                       whitening=whitening if factored else None)
         if show_progress:
-            print("wrote {0} x {0} matrix to {1} ({2:.1f} MB)".format(
-                info["dimension"], output_path, output_path.stat().st_size / 1024 ** 2))
+            size = output_path.stat().st_size / 1024 ** 2
+            if factored:
+                print("wrote the rank-{0} factor of a {1} x {1} matrix to {2} ({3:.2f} MB; "
+                      "dense would be {4:.2f} MB), isometry error {5:.1e}".format(
+                          whitening.latent, info["dimension"], output_path, size,
+                          info["dimension"] ** 2 * 8 / 1024 ** 2,
+                          info["latent_isometry_error"]))
+            else:
+                print("wrote {0} x {0} matrix to {1} ({2:.1f} MB)".format(
+                    info["dimension"], output_path, size))
 
     if diagnostics_path is not None:
         diagnostics_path = Path(diagnostics_path)
@@ -365,13 +494,21 @@ def load_covariance(path, expected_columns=None):
         distance computed in the wrong basis.
     """
     path = Path(path)
+    factor = None
     if path.suffix.lower() == ".csv":
         frame = pd.read_csv(path, index_col=0)
         matrix, columns = frame.to_numpy(dtype=float), list(frame.columns)
     elif path.suffix.lower() == ".npz":
         stored = np.load(path, allow_pickle=False)
-        matrix = np.asarray(stored["matrix"], dtype=float)
         columns = [str(name) for name in stored["columns"]]
+        if "basis" in stored.files:
+            # The rank-r factor. Kept factored rather than multiplied out, so callers can
+            # project into latent coordinates instead of the full width.
+            factor = (np.asarray(stored["basis"], dtype=float),
+                      np.asarray(stored["scale"], dtype=float))
+            matrix = None
+        else:
+            matrix = np.asarray(stored["matrix"], dtype=float)
     else:
         raise ValueError(
             "unsupported matrix format {0!r} for {1}; expected one of {2}".format(
@@ -385,6 +522,38 @@ def load_covariance(path, expected_columns=None):
                     next((i for i, (a, b) in enumerate(zip(columns, expected_columns))
                           if a != b), min(len(columns), len(expected_columns)))))
     return matrix
+
+
+def load_whitening(path, expected_columns=None):
+    """The fitted metric as a :class:`Whitening`, whichever form it was stored in.
+
+    Callers that only want to multiply should use this and call ``apply``; it keeps the factor
+    when there is one, so the multiplication is ``2 N D r`` instead of ``N D^2`` and the result
+    is *r* columns rather than *D*. A matrix stored densely - anything written before the factor
+    existed - loads as a dense `Whitening` and behaves exactly as it always did.
+    """
+    path = Path(path)
+    if path.suffix.lower() == ".npz":
+        stored = np.load(path, allow_pickle=False)
+        columns = [str(name) for name in stored["columns"]]
+        _check_columns(path, columns, expected_columns)
+        if "basis" in stored.files:
+            return Whitening(np.asarray(stored["basis"], dtype=float),
+                             np.asarray(stored["scale"], dtype=float), columns)
+        return Whitening.from_dense(np.asarray(stored["matrix"], dtype=float), columns)
+
+    return Whitening.from_dense(load_covariance(path, expected_columns))
+
+
+def _check_columns(path, columns, expected_columns):
+    if expected_columns is None or columns == list(expected_columns):
+        return
+    raise ValueError(
+        "covariance at {0} does not match the corpus it is being applied to: it has {1} "
+        "terms, the corpus has {2}, and the first difference is at position {3}"
+        .format(path, len(columns), len(expected_columns),
+                next((i for i, (a, b) in enumerate(zip(columns, expected_columns))
+                      if a != b), min(len(columns), len(expected_columns)))))
 
 
 def main(argv=None):

@@ -1,4 +1,4 @@
-"""Score intervals by isolation rather than by distance to the nearest normal one.
+﻿"""Score intervals by isolation rather than by distance to the nearest normal one.
 
 The alternative to the pooled Mahalanobis-kNN detector, and on C-MAPSS the stronger of the two.
 Measured on FD001, same corpus intervals, same depth banding, same k-fold calibration over source
@@ -56,7 +56,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from anomalies_scale.covariance_creation import load_covariance, read_corpus, signature_matrix
+from anomalies_scale.covariance_creation import (
+    Whitening, load_whitening, read_corpus, signature_matrix)
 from anomalies_scale.crossvalidated_thresholding import parse_statistic, source_of, stream_folds
 
 #: Trees per forest. 200 is what the measurements above used.
@@ -95,7 +96,11 @@ class DepthForests:
         self.forests = {int(depth): forest for depth, forest in forests.items()}
         self.band = int(band)
         self.space = space
-        self.scorer_covariance = np.asarray(scorer_covariance, dtype=float)
+        # A `Whitening`, not an array: it may hold a rank-r factor, and flattening it here would
+        # send the scorer's queries to full width while the forests were fitted on r columns.
+        self.scorer_covariance = (
+            scorer_covariance if isinstance(scorer_covariance, Whitening)
+            else Whitening.from_dense(np.asarray(scorer_covariance, dtype=float)))
         self._dimension = int(dimension)
         self._n_intervals = int(n_intervals)
         self.terms = list(terms) if terms is not None else None
@@ -184,12 +189,19 @@ def prepare(corpus, covariance, space):
         # Identity, so the scorer's transform is a no-op and every detector reaches its own
         # space the same way. Wasteful by one matmul per query and worth it for having a
         # single code path.
-        return signatures, depths, streams, terms, np.eye(signatures.shape[1])
+        return (signatures, depths, streams, terms,
+                Whitening.from_dense(np.eye(signatures.shape[1])))
 
     if isinstance(covariance, (str, Path)):
-        covariance = load_covariance(covariance, expected_columns=terms)
-    covariance = np.asarray(covariance, dtype=float)
-    return signatures @ covariance.T, depths, streams, terms, covariance
+        covariance = load_whitening(covariance, expected_columns=terms)
+    elif not isinstance(covariance, Whitening):
+        covariance = Whitening.from_dense(np.asarray(covariance, dtype=float))
+    # The forests are fitted on whatever `apply` returns - latent coordinates under a factored
+    # metric - and `scorer_covariance` carries the same object, so a query reaches the same
+    # space. A forest cuts on axes, and these are a rotation of the whitened ones rather than
+    # the whitened ones themselves; that is a real difference for `space: whitened`, and the
+    # reason `detect.forest.space: raw` is unaffected.
+    return covariance.apply(signatures), depths, streams, terms, covariance
 
 
 def fit_forests(corpus, covariance, band=1, space="whitened",

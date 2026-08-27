@@ -44,7 +44,8 @@ from pathlib import Path
 import faiss
 import numpy as np
 
-from anomalies_scale.covariance_creation import load_covariance, read_corpus, signature_matrix
+from anomalies_scale.covariance_creation import (
+    Whitening, load_whitening, read_corpus, signature_matrix)
 
 #: Provenance carried per indexed row, so a neighbour can be traced back to the interval it
 #: came from. `depth` is handled separately, since the band logic needs it directly.
@@ -369,8 +370,9 @@ def build_index(corpora, covariance, output_index, output_meta=None, band=1,
     splits = np.concatenate(splits)
 
     if isinstance(covariance, (str, Path)):
-        covariance = load_covariance(covariance, expected_columns=columns)
-    covariance = np.asarray(covariance, dtype=float)
+        covariance = load_whitening(covariance, expected_columns=columns)
+    elif not isinstance(covariance, Whitening):
+        covariance = Whitening.from_dense(np.asarray(covariance, dtype=float))
 
     # Measured against the fit rows, which are what the metric was fitted on and so the only
     # rows a whitening is guaranteed to bring to unit variance.
@@ -384,11 +386,17 @@ def build_index(corpora, covariance, output_index, output_meta=None, band=1,
     # config: `metric.form` is a key, and setting it to `pinv` would produce a matrix that
     # indexes and searches perfectly happily while computing Sigma^-2 distances. Turn this on
     # when feeding the module by hand, or after changing that key.
-    scale = (check_is_whitening(reference, covariance) if check_whitening
-             else whitened_scale(reference, covariance))
+    # The idempotency probe is a statement about the D x D matrix, so it needs the dense form
+    # even when the factor is what was loaded.
+    scale = (check_is_whitening(reference, covariance.dense()) if check_whitening
+             else whitened_scale(reference, covariance.dense()))
 
     keep = stratified_subsample(depths, nn_reference_size, random_state)
-    whitened = np.ascontiguousarray(whiten(signatures[keep], covariance), dtype="float32")
+    # Latent coordinates when the metric is factored: r columns rather than D, holding exactly
+    # the same distances. The index is r/D of the size and the search r/D of the work - on
+    # FD001 that is 1.29 MB against 76.1 MB - and FAISS returns identical neighbours because
+    # the projection is an isometry, which `create_covariance` asserts before writing.
+    whitened = np.ascontiguousarray(covariance.apply(signatures[keep]), dtype="float32")
     depths, splits = depths[keep], splits[keep]
 
     index = faiss.IndexFlatL2(whitened.shape[1])

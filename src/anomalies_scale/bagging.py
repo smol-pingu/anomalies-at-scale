@@ -126,7 +126,11 @@ def one_draw(corpus_streams, test_streams, columns, trunc, granularity, variance
     streams = np.asarray([source_of(name) for name in corpus[STREAM_COLUMN].to_numpy()])
 
     matrix, info = covariance_matrix(signatures, variance_keep=variance_keep, form="inv_sqrt")
-    whitened = np.ascontiguousarray(signatures @ matrix.T, dtype="float32")
+    # The factor rides along on the diagnostics. A draw is already a small problem - 42 terms at
+    # 5 channels - so the latent projection saves little here, but using it keeps every detector
+    # in the pipeline reaching its space the same way.
+    metric = info["whitening"]
+    whitened = np.ascontiguousarray(metric.apply(signatures), dtype="float32")
 
     if detector == "isolation_forest":
         from anomalies_scale.isolation_detector import (
@@ -155,7 +159,6 @@ def one_draw(corpus_streams, test_streams, columns, trunc, granularity, variance
         index.add(whitened)
         engine = PooledIndex(index, depth=depths, split=np.zeros(len(depths), dtype=int),
                              band=band, terms=terms)
-        metric = matrix
 
     scored = score_streams(restrict_channels(test_streams, columns), engine, metric,
                            threshold=thresholds, span=span, sig_tol=sig_tol, tol=tol,

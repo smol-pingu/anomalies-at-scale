@@ -117,8 +117,11 @@ class StreamScorer:
     def __init__(self, index, covariance, threshold, normaliser=None, trunc=None, span=None,
                  subspace=None, subspace_threshold=None, signature_projection=None,
                  neighbours=1):
+        from anomalies_scale.covariance_creation import Whitening
+
         self.index = index
-        self.covariance = np.asarray(covariance, dtype=float)
+        self.covariance = (covariance if isinstance(covariance, Whitening)
+                           else Whitening.from_dense(np.asarray(covariance, dtype=float)))
         self.threshold, self.threshold_info = resolve_threshold(threshold)
         self.normaliser = normaliser
         #: Which neighbour's distance is the score - 1 the nearest, n the n-th nearest. Must
@@ -188,7 +191,13 @@ class StreamScorer:
                 raise ValueError(
                     "the corpus was reduced to a latent signature space, so the index width no "
                     "longer says what truncation it was built at. Pass `trunc` explicitly.")
-            self.trunc = infer_truncation(width, self.index.dimension)
+            # The number of *signature terms*, not the index width. Under a factored metric the
+            # index holds r latent coordinates and inferring from that would give the wrong
+            # truncation - silently, since a plausible level would come back. `terms` carries
+            # the signature column names and so is D whatever the index stores.
+            terms = getattr(self.index, "terms", None)
+            self.trunc = infer_truncation(
+                width, len(terms) if terms else self.index.dimension)
         return self.trunc
 
     def signature(self, path, lo, hi):
@@ -207,7 +216,7 @@ class StreamScorer:
             # Into the latent space the corpus was reduced to, before the metric - which was
             # fitted on latent vectors and has no meaning applied to a full-width one.
             vector = np.asarray(self.signature_projection.transform(vector), dtype=float)
-        return vector, vector @ self.covariance.T
+        return vector, self.covariance.apply(vector)
 
     def score(self, path, lo, hi):
         """Squared Mahalanobis distance from interval ``[lo, hi]`` to its `neighbours`-th normal.
@@ -345,14 +354,15 @@ def score_streams(streams, index, covariance, threshold, normaliser=None, trunc=
     frame = read_canonical(streams)
 
     if isinstance(covariance, (str, Path)):
-        from anomalies_scale.covariance_creation import load_covariance
+        from anomalies_scale.covariance_creation import load_whitening
 
-        # Already an array: load_covariance drops the term labels once it has used them to
-        # check the matrix lines up with the corpus.
-        covariance = load_covariance(covariance)
+        # Keeps the factor when the metric was stored factored, so a query is projected into the
+        # same r coordinates the index holds rather than multiplied out to full width.
+        covariance = load_whitening(covariance)
     elif isinstance(covariance, pd.DataFrame):
         covariance = covariance.to_numpy()
-    covariance = np.asarray(covariance, dtype=float)
+    # `StreamScorer` wraps anything that is not already a Whitening, so a bare array from a
+    # caller keeps working exactly as before.
 
     if isinstance(normaliser, (str, Path)):
         from anomalies_scale.normalisation import Normaliser

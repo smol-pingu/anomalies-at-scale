@@ -406,6 +406,38 @@ metric:
   # configuration is unreachable.
   file_format: npz
 
+  # Store the rank-r factor of the whitening rather than multiplying it out, and index in the
+  # r latent coordinates rather than the D signature terms.
+  #
+  # `covariance_matrix` already builds W as V_r.T diag(s) V_r with V_r of shape (r, D) and
+  # orthonormal rows, then densifies it. On C-MAPSS that is a 650 x 650 matrix of rank 8 to 11 -
+  # 422,500 numbers expressing something that needs 7,150.
+  #
+  # Keeping the factor is not only smaller. Because V_r has orthonormal rows, the latent
+  # coordinates z = x V_r.T diag(s) are an *exact* isometry of the whitened vectors:
+  #
+  #     ||x_w - y_w||^2 = (z_x - z_y) V_r V_r.T (z_x - z_y).T = ||z_x - z_y||^2
+  #
+  # since V_r V_r.T = I_r. So FAISS over r coordinates returns identical neighbours and
+  # identical distances to FAISS over D, at r/D of the memory and the search cost:
+  #
+  #   FD001 (r = 11)   covariance 3.38 MB -> 57 KB     index 76.1 MB -> 1.29 MB
+  #   FD004 (r =  8)                     -> 41 KB      index  240 MB ->    4 MB
+  #
+  # The claim is exact rather than approximate, and `create_covariance` measures it before
+  # writing anything - it refuses to write a factor whose distances disagree with the dense
+  # form's by more than 1e-6 relative, because a silent failure here would produce plausible
+  # numbers in the wrong geometry.
+  #
+  # Two things it does not change. The off-manifold test still uses the *unwhitened* vectors, so
+  # it is unaffected. And `detect.forest.space: whitened` fits its trees on these coordinates,
+  # which are a rotation of the full-width whitened ones - a forest cuts on axes and is not
+  # rotation-invariant, so that arm may move. `space: raw` never touches the metric at all.
+  #
+  # false keeps the dense matrix, which is what every artifact written before this key contains;
+  # `load_whitening` reads either form, so old files keep working.
+  factored: true
+
 # --- threshold calibration -------------------------------------------------------------
 calibrate:
   # Folds for the cross-validation, over *streams* rather than intervals. Splitting intervals

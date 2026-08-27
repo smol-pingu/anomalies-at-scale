@@ -105,11 +105,15 @@ def ranking_metrics(scores, actual):
 
 
 def resolve_covariance(covariance):
-    """The metric as an array, whether it arrived as one, a frame, or a path to one."""
-    if isinstance(covariance, (str, Path)):
-        from anomalies_scale.covariance_creation import load_covariance
+    """The metric, whether it arrived as a `Whitening`, an array, a frame, or a path.
 
-        return load_covariance(covariance)
+    `load_whitening` keeps the rank-r factor when there is one, so a query is projected into the
+    same latent coordinates the index holds. `StreamScorer` wraps anything else.
+    """
+    if isinstance(covariance, (str, Path)):
+        from anomalies_scale.covariance_creation import load_whitening
+
+        return load_whitening(covariance)
     if isinstance(covariance, pd.DataFrame):
         return covariance.to_numpy()
     return covariance
