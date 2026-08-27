@@ -1,0 +1,241 @@
+# Configuration for the per-interval anomalies-at-scale workflow.
+#
+# Every parameter the pipeline depends on lives here, so a run is reproducible from this file
+# plus the raw data. Snakemake re-runs any rule whose inputs or parameters change.
+#
+# Deliberately separate from the pooled workflow's configuration rather than shared. Several
+# keys that matter there have no meaning here - there is no persisted corpus to choose a
+# format for, no index to cap, and no depth band, because the reference set for an interval is
+# that interval and nothing else. Sharing one file would mean half of it silently not applying.
+
+# --- data ------------------------------------------------------------------------------
+dataset: nyc_taxi
+
+# Corpus and test data are configured separately, because that is how labelled benchmarks
+# ship. Each list may hold any number of URLs, one download job each. Either may be left empty
+# and the files placed under data/raw/{dataset}/{corpus,test}/ by hand; an empty test list
+# additionally means "cut the test period off the end of the corpus series".
+raw:
+  corpus_urls: []
+  test_urls: []
+  # Column holding time. A name for data that has column names, a position for data that does
+  # not - preprocessing names a headerless stream's columns Time and Variable_1, Variable_2,
+  # and a nameless file cannot be asked about by name. null for no time channel, in which case
+  # the row index is used.
+  time_column: null
+  # Value channels to keep. null means every column except the resolved time channel, which
+  # is what multivariate data usually wants - SMD carries 38 of them.
+  value_column: null
+
+# --- corpus / test split -----------------------------------------------------------------
+# Two ways only. The train/withhold split that calibrates each threshold is made inside
+# detect, freshly at every interval, so there is no fit/withheld division out here.
+split:
+  # Used only when raw.test_urls is empty, i.e. when the test period must be cut out of the
+  # corpus series because the dataset did not ship one separately.
+  base_fraction: 0.572
+  # There is no fit/withheld split out here: detect makes a fresh train/withhold split of
+  # the corpus at every interval, so splitting again would only split twice.
+
+# --- channel reduction (UMAP) ------------------------------------------------------------
+# Pure preprocessing. One projection is fitted on the corpus, both sides are transformed into
+# its latent space, and every stage after this point reads latent streams without knowing a
+# reduction happened. Signatures, covariance, thresholds and the search are all untouched.
+#
+# The reason it exists is that signature dimension is roughly d ** trunc - polynomial in the
+# length of the path but exponential in the truncation level, with the channel count as the
+# base of that exponent. SMD's 38 value channels become 39 with time adjoined, and at trunc 4
+# that is 2,374,320 terms: a corpus that cannot be built at all. Reducing to 4 latent channels
+# takes it to 780.
+#
+# How the alignment is sliced
+# ---------------------------
+# One embedding per *instant*, not per stream. Slice t holds one row per corpus stream and the
+# alignment relation links stream j at instant t to stream j at instant t+1 - the same stream
+# one step later, which is true by construction rather than assumed.
+#
+# The alternative, one slice per stream, asserts instead that row t of one stream corresponds
+# to row t of the next, i.e. that the streams are synchronised. Measured on SMD windows that
+# assumption failed badly (alignment drift 3.12 against a threshold of 0.25) and the detectors
+# built on it collapsed to an F1 of 0.004.
+#
+# What this costs
+# ---------------
+# One UMAP fit per instant, each over as many points as there are corpus streams. That is
+# affordable for short streams and many of them, and unaffordable for the reverse: a
+# 28,479-point stream with 28 of them would need 28,479 fits of 28 points each. The stage
+# refuses shapes it cannot handle rather than running for a day.
+umap:
+  # The toggle and the size, in one number: the dimension of the latent space.
+  #
+  #   -1  off. No projection is fitted, no stage enters the DAG, and every downstream rule
+  #       reads the raw files exactly as it did before this stage existed.
+  #    j  reduce to j latent channels.
+  #
+  # 0 is rejected rather than read as "off", and so is anything below -1.
+  #
+  # Off by default. The reduction exists for the case where the channel count makes the corpus
+  # unbuildable - signature dimension is roughly d ** trunc, so SMD's 39 channels at trunc 4
+  # are 2,374,320 terms - and that is a specific problem, not the usual one. When it is off no
+  # projection is fitted and no stage enters the DAG: `preprocess` reads the canonical sets
+  # `canonicalise` wrote, unchanged. Turning it on interposes a stage that reads those same
+  # files and writes canonical sets of the same shape, so nothing downstream is aware either
+  # way.
+  dimension: -1
+  # Which axis the alignment runs along. This is a claim about the corpus, not a tuning knob.
+  #
+  #   per_stream   one slice per stream, rows are instants. Asserts the streams are
+  #                synchronised - that row t means the same thing in every one of them. One
+  #                mapper then places a whole stream, so a smooth path stays smooth, and test
+  #                streams need not match the corpus length.
+  #   per_instant  one slice per instant, rows are streams. Asserts only that a stream at time
+  #                t relates to itself at t+1, which is true by construction. Consecutive
+  #                points are placed by different mappers, so path smoothness becomes something
+  #                to measure rather than assume.
+  #
+  # per_instant is the default on measured evidence. `alignment_drift` tests the per_stream
+  # premise directly, against a 0.25 threshold, and it fails even in the ideal case: on
+  # synthetic streams that are identical up to noise it reads 0.937, and it rises with the
+  # number of corpus streams (5 slices 0.40, 20 slices 0.64, 80 slices 1.83). Since the slice
+  # count *is* the corpus size under that slicing, it degrades as the corpus grows. Coupling
+  # every slice to every other recovers only about 30%, and nothing at all once the streams
+  # are genuinely desynchronised. SMD measured 3.12.
+  #
+  # per_stream is kept because the premise is a property of the corpus, not of the method, and
+  # a small corpus of genuinely synchronised runs may well pass. Check the diagnostics.
+  slicing: per_instant
+  # UMAP's neighbourhood size, capped internally at one less than the number of corpus streams
+  # - each instant is embedded from one point per stream, so that is all the points there are.
+  n_neighbors: 15
+  min_dist: 0.1
+  # How many instants on each side each embedding is aligned against. AlignedUMAP couples every
+  # instant to this many before and after - 3 means a seven-slice window centred on itself.
+  #
+  # This is the knob that governs path smoothness, and directly so. Consecutive points of a
+  # stream are placed by *adjacent* mappers, so the risk in this slicing is that mapper t and
+  # mapper t+1 disagree and their disagreement enters the path as length the signature then
+  # integrates. The alignment penalty is what prevents that, and this is its reach.
+  #
+  # Wider holds more of the trajectory mutually consistent, at the cost of each instant being
+  # less free to follow its own local geometry and more alignment work per epoch. At 1 each
+  # instant is tied only to its immediate neighbours - the least coupling that still makes this
+  # an alignment rather than an independent UMAP per instant. Capped at the number of instants.
+  alignment_window_size: 3
+  # Standardise channels before embedding. Keep this on. It is *not* the normalisation layer
+  # this pipeline removed - that was dropped because Mahalanobis distance accounts for variance,
+  # which is true downstream of the signature. UMAP is upstream of it and builds its neighbour
+  # graph under a plain Euclidean metric, so a channel measured in thousands would decide the
+  # embedding alone. The scaler is fitted on the corpus only and saved inside the projection.
+  standardise: true
+  # Seed. Controls both UMAP's random_state and its transform_seed, because AlignedUMAP seeds
+  # its joint optimisation from the latter and ignores the former - changing random_state alone
+  # produces a bit-identical embedding.
+  random_state: 0
+  # Where to cache the fitted projection. The fit is the expensive part by a wide margin -
+  # 27 minutes against 74 seconds to transform everything with it - so a rerun on unchanged
+  # inputs reloads instead. The cache key is a hash of the corpus block and every fit
+  # parameter, so a changed corpus, split or setting misses and refits. null disables it.
+  cache_dir: data/projected/cache
+
+# --- signatures --------------------------------------------------------------------------
+signature:
+  # Truncation level. Output dimension is siglength(width, trunc) and grows fast - at width 2
+  # that is 30 terms for trunc 4 and 62 for trunc 5. It bites harder here than in the pooled
+  # workflow: each interval's covariance is fitted from one vector per corpus stream, so D
+  # climbing while N stays fixed goes straight into the rank problem below.
+  trunc: 4
+  # Column identifying which stream each row belongs to, when a file holds several. null when
+  # every input file is exactly one stream.
+  stream_column: null
+
+# --- the per-interval metric -------------------------------------------------------------
+metric:
+  # Keep the leading components carrying this fraction of each interval's signature variance.
+  #
+  # This matters more here than in the pooled workflow, and for a structural reason. A pooled
+  # corpus offers thousands of vectors to estimate one covariance; a single interval offers
+  # one per corpus stream. On SMD the per-interval fits retained a mean rank of 43 out of 992
+  # dimensions. Rank truncation is not tidying up at that ratio, it is what makes the estimate
+  # exist at all.
+  variance_keep: 0.999
+
+# --- per-interval threshold --------------------------------------------------------------
+calibrate:
+  # How the withheld distances at one interval become that interval's threshold: `max`,
+  # `median`, or a percentile written `p99` / `p99.9`.
+  #
+  # A high percentile rather than `max`, so the threshold is not decided by the single worst
+  # withheld stream. SigNova fits a generalised extreme-value distribution to its calibration
+  # scores instead, which is the better-founded version of the same idea; a percentile is the
+  # cheap approximation to it, and at least uses the tail rather than one point of it.
+  #
+  # IMPORTANT in this workflow. The threshold is calibrated from `withhold_fraction` of the
+  # corpus *streams*, which is a small number, and np.percentile places p99.9 at index
+  # (n - 1) * 0.999. Below a few hundred samples that lands between the top two values, so the
+  # percentile and the maximum are near-identical; at n = 2 they are exactly equal. Raise
+  # withhold_fraction, or use a larger corpus, for this setting to differ from `max` at all.
+  statistic: p99.9
+  # Fraction of the corpus withheld at each interval to measure that interval's threshold.
+  # 5% of the corpus streams: with 40 normal streams that is 2 samples, which is too few for
+  # any tail statistic to be meaningful - see the note above. Worth raising well above 0.05
+  # unless the corpus runs to hundreds of streams.
+  withhold_fraction: 0.05
+  # Seed for that split, so a run is reproducible.
+  random_state: 0
+
+# --- detection ---------------------------------------------------------------------------
+detect:
+  # How each depth band is structured for searching. This is a query-time choice, not a
+  # property of the stored artifact: the index on disk is a flat vector store either way, and
+  # the band views are built on load, so switching costs a reload rather than a rebuild.
+  #
+  #   exact  IndexFlatL2. Brute force, no training, the true nearest neighbour every time.
+  #   ivf    IndexIVFFlat. k-means into `nlist` cells, searching the `nprobe` nearest.
+  #   hnsw   IndexHNSWFlat. A navigable small-world graph. No training, no clustering.
+  #
+  # All three store vectors in full, so reported distances are exact; what becomes approximate
+  # under the latter two is *which* neighbours are found. That error is directional - a missed
+  # nearest neighbour can only inflate a distance, never shrink it - so an approximate index
+  # biases toward over-flagging, and a threshold calibrated under one setting does not
+  # transfer to another. Recalibrate if you change this.
+  #
+  # Prefer hnsw over ivf if you need speed. This index is searched *after* whitening, and
+  # Sigma^-1/2 gives the corpus unit variance in every retained direction by definition - which
+  # removes exactly the anisotropy k-means needs to find separable cells. HNSW navigates the
+  # vectors' own neighbour relations instead, and those survive whitening intact.
+  index:
+    type: exact          # exact | ivf | hnsw
+    # ivf only. nlist defaults to 4*sqrt(n); both are capped at what the band can train.
+    nlist: null
+    nprobe: 8
+    # hnsw only. ef_search is the recall knob - raise it to explore more of the graph.
+    hnsw_m: 32
+    ef_construction: 200
+    ef_search: 64
+  # Resolution floor as a power of two, in points: sig_tol 2 means the search never tests an
+  # interval narrower than 4 points and so cannot localise anything shorter.
+  sig_tol: 2
+  # Boundary extension step, as a power of two. Once the search has a clean block it pushes
+  # its edges outward in steps of this size for as long as they keep passing, which is what
+  # lets a normal section end somewhere other than a dyadic boundary.
+  #
+  # It is not free here in the way it is for the pooled detector. An extension test asks about
+  # an interval that is not a tree node, and in this workflow every distinct interval is a
+  # fresh corpus slice, covariance fit and threshold - a whole model, not one more query
+  # against a prebuilt index. Smaller steps localise better and cost proportionally more.
+  tol: 0
+
+# --- evaluation --------------------------------------------------------------------------
+evaluate:
+  # Also draw streams with nothing flagged. Off by default: on a run of any size they are the
+  # overwhelming majority, and a directory of flat lines buries the few plots worth looking at.
+  plot_clean_streams: false
+  # Cap on figures drawn, most severe first by ratio. null for no cap.
+  max_plots: 25
+  # Value channels drawn per stream.
+  max_channels: 5
+
+# --- output ------------------------------------------------------------------------------
+output:
+  # Format for the scores, the interval report and the per-stream summary: parquet or csv.
+  format: parquet

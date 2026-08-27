@@ -1,0 +1,769 @@
+# Configuration for the anomalies-at-scale Snakemake workflow.
+#
+# Every parameter the pipeline depends on lives here, so a run is reproducible from this
+# file plus the raw data. Snakemake re-runs any rule whose inputs or parameters change.
+
+# --- data ------------------------------------------------------------------------------
+dataset: cmapss_fd001
+
+# Where the raw data comes from. The corpus of normality and the data to be scored are
+# configured separately, because that is how labelled benchmarks ship - SMD gives train/ and
+# test/ as distinct contiguous periods, and cutting a test period out of the corpus series is
+# only needed for datasets that do not.
+#
+# Each list may hold any number of URLs, and every one becomes its own download job, so a
+# dataset spread over many files - one per machine, say - fetches in parallel and a failure
+# part-way through only costs the files that had not arrived. Files are named after the last
+# path segment of their URL.
+#
+# Either list may be left empty, and files placed under data/raw/{dataset}/corpus/ or
+# data/raw/{dataset}/test/ by hand instead; whatever is in those directories is then used.
+raw:
+  # Data assumed anomaly-free. Everything the metric and the threshold are built from.
+  corpus_urls: []
+  # Data to be scored. Leaving this empty additionally means "cut the test period off the
+  # end of the corpus series", using split.base_fraction below.
+  test_urls: []
+  # Value channels to keep. null means every column except the resolved time channel,
+  # which is what multivariate data usually wants - SMD carries 38 of them.
+  value_column: null
+  # Column to use as the signature's time channel. Set to null to fall back to the row
+  # index. Channel scale needs no normalisation stage: rescaling a channel induces an
+  # invertible linear map on the signature, and Mahalanobis distance is invariant under
+  # those, so the whitening absorbs it. Large raw values do still cost precision when
+  # intervals are composed through Chen's identity - that happens in build_corpus, before
+  # any distance exists - so measure with create_corpus_merged.composition_error before
+  # raising signature.trunc.
+  time_column: 1        # `cycle`, by position - the file has no header
+
+# --- preprocessing -----------------------------------------------------------------------
+preprocess:
+  # Delay embedding. 0 is off; n appends a copy of every value channel shifted back n steps,
+  # widening the path from 1 + k channels to 1 + 2k.
+  #
+  # Why it is worth the width. A signature integrates each channel against every other, but
+  # never against itself: the level-2 term S(i,i) is just half the square of the channel's total
+  # increment, and carries no information about the order things happened in. So two windows
+  # that start and end at the same values are indistinguishable at level 2 no matter how
+  # differently they got there - a smooth ramp and a violent oscillation sign identically.
+  #
+  # A delayed copy fixes that: S(i, i_lag) is a genuine cross term whose antisymmetric part
+  # depends on the route taken, not just the endpoints. Measured on a 33-point test pair, a
+  # smooth ramp and a jagged path with identical endpoints sign bit-identically at truncation 2
+  # without a lag, and separate about six-fold with one.
+  #
+  # This is the lead-lag idea of the rough-paths literature but not its exact form. The textbook
+  # construction interleaves lead and lag on a doubled time grid, and its signed area is then
+  # exactly half the channel's quadratic variation; appending a column on the original grid only
+  # approximates that (sum of squared increments 1.788 against a signed area of 0.179 on the
+  # test path above). It is much cheaper - path lengths, the dyadic grid and the point indices a
+  # flag is reported in all stay as they were - and the ordering it induces is what it is for.
+  #
+  # What it costs. Signature dimension is roughly width ** trunc, so doubling the channels
+  # multiplies the corpus by about 2 ** trunc. On C-MAPSS's 24 channels at truncation 2 that is
+  # 650 terms becoming 2,450, and the covariance a 2,450 x 2,450 matrix - which is written as
+  # CSV, so expect a large file. At truncation 3 or above, check the arithmetic before enabling.
+  #
+  # The first n rows of every stream have no history, and take the stream's initial value -
+  # the reading is treated as having been stationary at that value for the n steps before the
+  # record starts. That is an assumption, and it shows as zero increment in the lagged channels
+  # over the opening steps, but it keeps every stream its original length, so point indices and
+  # any externally supplied labels stay in step. Dropping those rows instead would discard real
+  # measurements and silently shift every index by n.
+  lag: 0
+
+  # Which construction pairs a channel with its past. Only read when lag is non-zero.
+  #
+  #   delay      Append the delayed copy on the original time grid. Path length is unchanged,
+  #              so every point index downstream keeps meaning what it meant, and any lag is
+  #              allowed. Cheap, and approximate: it orders paths by how much they oscillate
+  #              without recovering the quadratic variation (0.179 against a true 1.788 on the
+  #              test path above).
+  #
+  #   lead_lag   The interleaved form, as implemented in SigNova's `_path_transforms`: double
+  #              the grid and advance the lead and the lag alternately, so an n-point stream
+  #              becomes 2n - 1 points. Exact - the signed area is precisely half the quadratic
+  #              variation - and only defined for a lag of 1.
+  #
+  # lead_lag is the better transform and the more expensive one. Beyond doubling the points, it
+  # makes every index downstream a lead-lag position rather than an observation: observation i
+  # sits at indices {2i - 1, 2i}. `evaluate` collapses that back before measuring anything, so
+  # the reported metrics stay in observation units and remain comparable across settings - but
+  # note that a window of n points now spans about n/2 observations, so `window.size` should be
+  # doubled to keep the effective span the same.
+  lag_method: delay
+
+# --- corpus / test split -----------------------------------------------------------------
+# One division, and usually it has already been made: labelled benchmarks ship the two sides
+# as distinct periods, and this section is then unused. Split by position rather than at
+# random - these are time series, so a random split would place neighbouring stretches of one
+# series on either side of the boundary.
+#
+# There used to be a `fit_fraction` here as well, cutting the corpus into a set that fitted the
+# metric and a withheld set the threshold was calibrated against. That existed because deriving
+# a threshold from the corpus's own nearest-neighbour distances understates what unseen normal
+# data scores by ~13x on SMD - point-wise F1 0.23 against a flag-everything floor of 0.17.
+# `crossvalidated_thresholding` now answers the same question by k-fold over streams, which
+# gives every interval a reference set without its own stream in it rather than only the fifth
+# of them that fell in the holdout, so the fixed cut has been removed.
+split:
+  # Fraction of the corpus series held as normal data; the remainder is tested. Used *only*
+  # when raw.test_urls is empty, i.e. when the test period has to be cut out of the corpus
+  # series because the dataset did not ship one separately. Ignored otherwise.
+  base_fraction: 0.572
+
+# --- channel reduction (UMAP) ------------------------------------------------------------
+# Pure preprocessing. One projection is fitted on the corpus, both sides are transformed into
+# its latent space, and every stage after this point reads latent streams without knowing a
+# reduction happened. Signatures, covariance, thresholds and the search are all untouched.
+#
+# The reason it exists is that signature dimension is roughly d ** trunc - polynomial in the
+# length of the path but exponential in the truncation level, with the channel count as the
+# base of that exponent. SMD's 38 value channels become 39 with time adjoined, and at trunc 4
+# that is 2,374,320 terms: a corpus that cannot be built at all. Reducing to 4 latent channels
+# takes it to 780.
+#
+# How it works now
+# ----------------
+# One UMAP is fitted on corpus rows, and then a distance-weighted kNN regressor is fitted from
+# ambient coordinates to embedded ones. That regressor is what every stream goes through -
+# corpus included, not just test - so both sides land in identical coordinates by construction.
+# A signature is only comparable to another signature of a path in the same coordinates.
+#
+# This replaced an AlignedUMAP arrangement, which was the wrong tool rather than a mistuned one.
+# AlignedUMAP fits one embedding per slice and couples them through a `relations` map that is
+# meant to identify genuinely shared samples between *overlapping* slices; it was handed disjoint
+# slices with relations asserting identity between different objects, and `alignment_drift` read
+# 3.5-4.3 against a 0.25 threshold as a result. It also offers no transform for unseen data at
+# all, which is what forced the contortions around test streams.
+#
+# Where it sits
+# -------------
+# Before `preprocess`, and therefore before any lead-lag. That ordering is load-bearing: lead-lag
+# pairs each channel with its own past, taking k channels to 2k, and reducing afterwards would
+# let UMAP mix a channel with its own delayed copy and dissolve the pairing the transform exists
+# to create. Reducing first gives k -> d and then d -> 2d.
+umap:
+  # The toggle and the size, in one number: the dimension of the latent space.
+  #
+  #   -1  off. No projection is fitted, no stage enters the DAG, and every downstream rule
+  #       reads the canonical sets `canonicalise` wrote, unchanged.
+  #    j  reduce to j latent channels.
+  #
+  # 0 is rejected rather than read as "off", and so is anything below -1.
+  #
+  # Off by default. The reduction exists for the case where the channel count makes the corpus
+  # unbuildable, and that is a specific problem rather than the usual one - C-MAPSS at width 25
+  # and truncation 2 is only 650 terms and needs no help.
+  dimension: -1
+
+  # Points of history in each row handed to UMAP. 1 embeds instants; m embeds the delay window
+  # [x_t, x_{t-1}, ..., x_{t-m+1}], so the embedding sees local dynamics rather than a single
+  # reading. This is TimeCluster's idea (Ali, Jones, Xie & Williams 2019) applied at point level
+  # so that the output is still one latent point per input point, and therefore still a path -
+  # TimeCluster itself embeds a whole window to a single point, which would leave nothing for a
+  # signature to integrate.
+  #
+  # Overlapping windows are handled by three rules. A row is anchored at its newest point, so
+  # every observation anchors exactly one row and gets exactly one latent point - path length is
+  # preserved and point indices keep meaning what they meant. Rows never cross a stream
+  # boundary, since a row spanning the join between two engines would embed a transition that
+  # never happened. And the fit set is strided (see fit_stride) so that overlapping rows cannot
+  # weight an observation by however many windows contain it.
+  #
+  # The first m - 1 points of a stream have no history and take the stream's own first
+  # observation for the missing slots, as preprocess.lag does.
+  context: 1
+
+  # Stride between rows used to *fit* the embedding. null means the context width, which makes
+  # the fit rows share no observation with one another. Every row is still transformed; this
+  # only affects what is learnt.
+  #
+  # It matters because consecutive context rows are near-duplicates: a neighbour graph built
+  # over them is dominated by trivial temporal adjacency, and would largely recover the clock
+  # rather than the structure of the data.
+  fit_stride: null
+
+  # UMAP's neighbourhood size for the embedding itself, capped internally at one less than the
+  # number of fit rows.
+  n_neighbors: 15
+  min_dist: 0.1
+
+  # Neighbours the kNN regressor averages over when placing a point. Distance-weighted, so this
+  # is a smoothing width rather than a hard count: raising it gives smoother latent paths and
+  # less faithful ones. Read `knn_relative_error` in the diagnostics to see what the
+  # approximation costs - it is the price of fitting a function rather than embedding directly.
+  knn_neighbours: 10
+
+  # Standardise channels before embedding. Keep this on. It is *not* the normalisation layer
+  # this pipeline removed - that was dropped because Mahalanobis distance accounts for variance,
+  # which is true downstream of the signature. UMAP is upstream of it and builds its neighbour
+  # graph under a plain Euclidean metric, so a channel measured in thousands would decide the
+  # embedding alone. The scaler is fitted on the corpus only and saved inside the projection.
+  standardise: true
+
+  # Seed for the embedding.
+  random_state: 0
+
+# --- windowing ---------------------------------------------------------------------------
+# Optional. Cuts every stream to one fixed length before anything is signed.
+#
+# The reason it exists is that the dyadic grid is *relative*: signature.granularity says how many
+# cells a stream is divided into, not how many points each holds. A corpus built from streams of
+# different lengths therefore puts intervals of different lengths in the same depth band, and the
+# nearest-neighbour search compares a query against whatever happens to share its band. On C-MAPSS,
+# whose engine records run from 31 to 303 cycles, that is a ten-fold spread inside one depth - and
+# a 31-cycle degradation fills the whole of a short engine's depth-0 interval against under a
+# third of a long one's, so the same physical event signs quite differently depending on which
+# engine it happened to. Measured, pipeline intervals ran 3.6-4.1x longer than the notebook's at
+# every depth, and the pipeline's whole deficit against it was recall.
+window:
+  # The toggle and the length, in one number: increments per window.
+  #
+  #   -1  off. No windowing stage enters the DAG and `corpus` and `score` read the whole
+  #       streams `preprocess` wrote, exactly as they did before this stage existed.
+  #    n  cut to n increments per window. Must be a power of two.
+  #
+  # Increments, not points - so a window holds n + 1 points, and consecutive windows share their
+  # boundary point. That is what makes the grid divide exactly: 16 increments at granularity 3
+  # give edges at 0, 2, 4, ..., 16, eight cells of two increments each. Sixteen *points* would
+  # give `np.linspace(0, 15, 9).round()` = 0 2 4 6 7 9 11 13 15, one cell a single increment
+  # wide, whose signature is smaller than its band-mates for no reason to do with the data.
+  #
+  # A power of two is required for the same reason - 20 increments at granularity 3 gives cells
+  # of 3, 2, 3, 2, 3, 2, 3, 2 and puts the raggedness straight back.
+  #
+  # Sizing it. The window must carry the grid, so n >= 2**granularity, and it should be long
+  # enough that a whole anomaly fits inside one: the notebook's 32 works on C-MAPSS, where the
+  # labelled degradation is 31 cycles. Longer windows dilute short anomalies; shorter ones give
+  # the widest-first search less room to localise anything.
+  #
+  # The final window of each stream is left short rather than padded. Carrying the last
+  # observation forward would append a run of zero increments, which signs as very nearly
+  # nothing - and on run-to-failure data that run sits exactly where the failure is, so the
+  # padding would manufacture normality in the one place the detector has to fire. Tails too
+  # short to carry the grid are dropped from the corpus splits and kept for scoring, where the
+  # widest-first search needs no grid.
+  #
+  # 16 on measured evidence. Sweeping 8 / 16 / 32 / 64 / off on C-MAPSS FD001, with everything
+  # else fixed:
+  #
+  #   size    P       R      F1    adjF1   flagged     (true anomaly rate 15.03%)
+  #      8  0.744   0.530   0.619   0.901   10.72%
+  #     16  0.837   0.458   0.592   0.910    8.23%
+  #     32  0.876   0.348   0.498   0.853    5.97%
+  #     64  0.944   0.293   0.447   0.808    4.66%
+  #    off  0.738   0.350   0.475   0.767    7.13%
+  #
+  # Recall was this pipeline's entire deficit and this is where it came back - 0.350 to 0.458 -
+  # with precision rising at the same time, which says the intervals became more informative
+  # rather than the threshold being traded. 8 scores a higher plain F1 but flags 10.7% against a
+  # true rate of 15.0%, and it is the floor granularity 3 allows (9 points, cells one increment
+  # wide), so there is no headroom below it and the trend cannot be read past it.
+  size: 16
+
+# --- signatures ------------------------------------------------------------------------
+signature:
+  # Put every signature component on a comparable scale before the metric is fitted.
+  #
+  # A level-k term is a k-fold iterated integral and scales like the increment to the k-th
+  # power, so the raw corpus concentrates its variance in whichever level has the largest
+  # increments - 1,363x between levels 1 and 2 on C-MAPSS. The whitening already rescales each
+  # retained direction, so this is not about the distance; it is about which directions survive
+  # metric.variance_keep, which cuts by share of total variance. Measured, it moved the retained
+  # rank from 8 directions (all level 2) to 39.
+  #
+  # The normaliser is fitted on the fit corpus and saved, because test signatures must be put
+  # in the same units - one refitted on test data would place the two sides in different ones.
+  #
+  # Off on measured evidence, and consistently so: it costs recall at every setting tried. With
+  # windowing at 16 it takes F1 from 0.592 to 0.474; without windowing, from 0.475 to 0.423. The
+  # argument above is sound about which directions survive variance_keep - the retained rank does
+  # move from 8 to 39 - but the extra 31 directions turn out to make the detector more selective
+  # rather than better, and this detector's problem was never selectivity.
+  normalise: false
+  # zscore | scale | maxabs | factorial. zscore centres and divides by standard deviation.
+  normalise_method: zscore
+  # Truncation level. Output dimension is siglength(width, trunc) and grows fast: at
+  # width 2 that is 30 terms for trunc 4 and 62 for trunc 5.
+  trunc: 2
+  # Finest dyadic interval, as a relative width of 2**-granularity. Depth 0 is the whole
+  # stream and every node beneath it is emitted too, because the widest-first pysegments
+  # search queries the narrower intervals as it bisects - the tree is the corpus, not just
+  # its leaves. A stream yields up to 2**(granularity + 1) - 1 intervals.
+  granularity: 3
+  # Column identifying which stream each row belongs to, when a file holds several. Leave
+  # null when every input file is exactly one stream. Set it and rows are grouped by it,
+  # each group signed independently, so a whole split can arrive as one long-format file.
+  stream_column: 0      # `unit`: 100 engines share one file, distinguished by this column
+  # Format the corpus is written in: parquet or csv. Parquet by some margin - a corpus is a
+  # wide float table, and CSV both inflates it several-fold and round-trips through decimal
+  # text - but csv is available for reading without a parquet engine.
+  format: parquet
+
+# --- signature-space reduction -------------------------------------------------------------
+# The other place a reduction can go. `umap` above compresses *channels*, before signing;
+# this compresses the *signature vectors*, after.
+#
+# Arithmetically this is the weaker lever. Signature dimension is roughly width ** trunc, so
+# reducing channels acts on the base of an exponent while reducing terms is merely linear - and
+# the corpus still has to be built at full width here, so nothing in this section makes an
+# unbuildable truncation buildable. C-MAPSS at trunc 4 is 406,900 terms either way.
+#
+# What it buys is that the path is never touched. Reducing channels discards information while
+# the data is still a path, and the signature can only integrate what survives; measured on
+# C-MAPSS that cost precision heavily - 0.853 down to about 0.50 - because degraded windows were
+# carried back among the normal ones before the signature ever saw them. Reducing afterwards
+# lets the signature see every channel at full width, and compresses only the description of it.
+#
+# The reduced corpus is still a corpus - same identity columns, fewer sig_* ones - so
+# `covariance`, `index` and `calibrate` are unchanged. Only `score` reads the projection, to
+# place the signatures it computes on the fly into the same latent space. That is why the
+# projection is a fitted function (UMAP plus a kNN regressor) rather than a bare embedding.
+#
+# Mutually exclusive with signature.normalise: the reduction standardises every term before
+# embedding, which is the same job, and doing both would apply it twice.
+signature_umap:
+  # -1 off; d reduces the signature corpus to d latent components. 0 is rejected.
+  dimension: -1
+  # UMAP's neighbourhood size for the signature embedding.
+  n_neighbors: 15
+  min_dist: 0.1
+  # Neighbours the kNN regressor averages over when placing a new signature. Read
+  # `knn_relative_error` in the sidecar to see what the approximation costs.
+  knn_neighbours: 10
+  # Cap on intervals used to fit the embedding; null for all of them. Sampled at random rather
+  # than truncated, because the corpus is ordered by depth and a head slice would fit the
+  # embedding on the widest intervals alone.
+  fit_rows: 50000
+  random_state: 0
+
+# --- the Mahalanobis metric --------------------------------------------------------------
+# Fitted on the fit streams only, never on withheld or test data, and rank-truncated by
+# retained variance rather than by a singular-value floor.
+metric:
+  # Keep the leading components carrying this fraction of the corpus's signature variance.
+  # build_whitening's rcond=1e-12 default keeps every direction - all 992 on SMD, where a
+  # few dozen carry 99.9% of the variance - and the whitening then divides by the rest,
+  # which is sampling noise. That is the mechanism behind the 13x in-sample optimism above.
+  #
+  # This is an honest hyperparameter, not a solved default. On SMD machine-1-1, 0.999 gives
+  # rank 56 and point-wise F1 0.398 while 0.9999 gives rank 116 and 0.532 - and choosing
+  # between them needs labels, which a corpus-of-normality method is meant not to require.
+  #
+  # NOTE, for constant channels. Channels that never move during training are kept rather
+  # than scrubbed, on the reasoning that any noise appearing in one is by definition unlike
+  # anything in the corpus. That reasoning is right, but this key is what decides whether it
+  # actually happens, and at present it does not. A channel with no training variance is an
+  # exactly-zero-variance direction, so the pseudo-inverse drops it and movement along it
+  # contributes *nothing* to the distance - measured: a dead channel driven to a raw
+  # signature spread of 2.52 still produced whitened distances of 0.2-0.8, indistinguishable
+  # from ordinary variation. Making it visible needs a floor on small singular values instead
+  # of truncation, which is a change to covariance_creation and a trade against the
+  # in-sample optimism the truncation exists to fix.
+  variance_keep: 0.999
+
+  # Which matrix the covariance stage writes. These are NOT interchangeable:
+  #
+  #   pinv      Sigma^-1, the pseudo-inverse. The matrix in the textbook Mahalanobis
+  #             formula, used as a quadratic form:  d2 = (x - y) @ M @ (x - y).T
+  #   inv_sqrt  Sigma^-1/2, its symmetric square root, which turns Mahalanobis distance into
+  #             plain Euclidean distance between transformed vectors:  d2 = ||(x - y) @ W||^2
+  #
+  # Pick inv_sqrt for anything that indexes with Euclidean distance - a FAISS IndexFlatL2
+  # does exactly that - because feeding it pinv computes (x - y) @ Sigma^-2 @ (x - y).T
+  # instead, weighting every direction quadratically. On signature data that is not a rounding
+  # error: the toy notebook measured the two formulas disagreeing by a factor of ~5e9, and it
+  # was the difference between localising two anomalies and missing them entirely.
+  #
+  # inv_sqrt here because `index` builds a FAISS IndexFlatL2 and searches it with Euclidean
+  # distance. index_creation refuses a matrix it can detect as pinv, since the substitution
+  # is otherwise silent.
+  form: inv_sqrt
+
+  # How that matrix is stored. NOTE this is `file_format`, not `form` above - they are one
+  # character apart and mean entirely different things: `form` decides which matrix is written,
+  # this decides how the bytes are laid out.
+  #
+  #   npz  numpy's archive, holding the matrix and the term names as two arrays. Uncompressed:
+  #        the matrix is dense float64 with little for zlib to find, so compression buys about a
+  #        tenth of the size and costs CPU on a file that `index`, `calibrate` and `score` each
+  #        read once per run.
+  #   csv  a labelled D x D table of decimal text. Readable without numpy, and what every
+  #        matrix fitted before this key existed is stored as - `load_covariance` dispatches on
+  #        the suffix, so those keep loading either way.
+  #
+  # It matters because the file grows with the *square* of the dimension:
+  #
+  #   terms      entries        csv       npz
+  #     650        423 K     8.8 MB    3.4 MB
+  #   5,525       30.5 M     ~600 MB    244 MB     log-signature at truncation 3
+  #  16,275        265 M       ~5 GB    2.1 GB     signature at truncation 3
+  #
+  # At the 650 terms this pipeline runs at today the difference is a rounding error. At
+  # truncation 3, or on a dataset wide enough to need one, parsing several GB of decimal text on
+  # every stage that reads the matrix stops being an inconvenience and becomes the reason the
+  # configuration is unreachable.
+  file_format: npz
+
+# --- threshold calibration -------------------------------------------------------------
+calibrate:
+  # Folds for the cross-validation, over *streams* rather than intervals. Splitting intervals
+  # would put a stream's own overlapping intervals on both sides of the boundary, which is the
+  # leak this exists to close.
+  #
+  # k = the number of streams is leave-one-stream-out. Measured on C-MAPSS the thresholds moved
+  # by under 5% between k=2 and k=100, so there is little to buy above a handful of folds - with
+  # 100 streams, holding out 1 or 50 leaves much the same reference set behind.
+  folds: 5
+  # How the calibration distances at one interval width become that width's threshold:
+  # `max`, `median`, or a percentile written `p99` / `p99.9`.
+  #
+  # A high percentile rather than `max`, because `max` is decided entirely by the single worst
+  # calibration interval and inherits all of that interval's noise. SigNova makes the same
+  # move more carefully still, fitting a generalised extreme-value distribution to the
+  # calibration scores and taking an upper confidence bound; a percentile is the cheap
+  # approximation to that, and uses the tail rather than one point of it.
+  #
+  # Note this only bites when there are enough calibration samples for the two to differ.
+  # np.percentile places p99.9 at index (n - 1) * 0.999, so below roughly 500 samples it sits
+  # between the top two values and is barely distinguishable from the maximum. The pooled
+  # workflow calibrates per interval width over all withheld intervals, which is usually
+  # thousands, so the distinction is real here.
+  statistic: p95
+
+  # Seed for the fold assignment. Streams are shuffled before being partitioned, because stream
+  # names often carry an order - machine-1-1 through machine-3-11, engines 1 to 100 - and
+  # contiguous blocks of that order can share properties that would make one fold
+  # systematically easier than another.
+  random_state: 0
+
+# --- detection -------------------------------------------------------------------------
+detect:
+  # Which question is asked of each candidate interval. Both run the same widest-first search
+  # over the same corpus intervals, with the same depth banding and the same k-fold calibration
+  # over source streams; only the per-interval score differs.
+  #
+  #   mahalanobis       Squared distance to the nearest normal interval, in the whitened space.
+  #                     Needs the covariance, and inherits its conditioning.
+  #   isolation_forest  How few random axis-aligned splits isolate the interval. No metric, no
+  #                     inverse, and invariant to rescaling any single coordinate - which
+  #                     matters on a signature corpus, where column standard deviations span a
+  #                     factor of 4.4e24 between level-1 and level-2 terms.
+  #
+  # Measured on FD001, everything else held fixed:
+  #
+  #   detector                             P       R      F1    adjF1   flagged
+  #   mahalanobis                        0.853   0.432   0.573   0.917    7.60%
+  #   isolation_forest, whitened         0.904   0.616   0.733   0.968   10.25%
+  #   isolation_forest, raw              0.723   0.927   0.813   0.849   19.27%
+  #
+  # mahalanobis remains the default because it is what the rest of this project is built and
+  # documented around, and because the comparison above is one dataset with one seed. The
+  # forest is the stronger of the two on every measurement taken so far.
+  method: mahalanobis
+
+  # Which neighbour's distance is the score: 1 is the nearest, n the n-th nearest. mahalanobis
+  # only - a forest and an LOF answer with a single number and ignore this.
+  #
+  # Raising it is a crude local-density estimate. The distance to the n-th neighbour is large
+  # where the corpus is sparse and small where it is dense, which is most of what LOF measures,
+  # minus LOF's normalisation against the neighbours' own densities.
+  #
+  # It helps on every subset, and it is recall that comes back - which was this detector's whole
+  # deficit. Swept with everything else fixed and the threshold recalibrated at each n:
+  #
+  #   n     FD001    FD002    FD003    FD004      (F1; 1 condition, 6, 1, 6)
+  #   1     0.573    0.417    0.564    0.498
+  #   2     0.629    0.451    0.599    0.543
+  #   3     0.636    0.473    0.615    0.564
+  #   4     0.632    0.493    0.634    0.579
+  #   5     0.626    0.499    0.626    0.588
+  #
+  # On FD001 that is precision 0.853 -> 0.839 against recall 0.432 -> 0.512: the flagged fraction
+  # rises 7.6% -> 9.2% and nearly all of it lands on true anomalies. The reason is that a 1-NN
+  # distance is decided by a single corpus interval, so a query sitting next to one unusually
+  # isolated normal interval scores high for a reason that has nothing to do with the query. The
+  # n-th neighbour is a more stable estimate of distance from the bulk of normality.
+  #
+  # The one-condition subsets peak at n=3-4 and turn over; the six-condition ones were still
+  # rising at n=5, which is where the sweep stopped rather than where they flatten. That split is
+  # what the regime structure predicts - with six flight conditions each cluster holds about a
+  # sixth of the corpus, so a given n reaches proportionally less far into the query's own regime.
+  #
+  # 3 on that evidence: better than 1 on all four subsets by +0.05 to +0.07, and a *fixed* value
+  # rather than the per-subset best, which would use the test labels and is not something an
+  # unsupervised deployment could do.
+  #
+  # NOTE that measurements recorded elsewhere in this file predate the change and were taken at
+  # n = 1 - the detector table above, the window sweep, the normalisation note. They remain
+  # correct relative to one another; they are simply not the numbers this configuration now
+  # produces. FD001 at these settings is F1 0.636, not 0.573.
+  #
+  # The threshold must be calibrated at the same n. `crossvalidated_thresholding` takes the
+  # argument for that reason and the workflow passes both from here, so they cannot drift apart:
+  # the n-th neighbour is systematically further than the first, and a threshold from one
+  # distribution applied to another would move the flagged fraction and read as an effect of n.
+  neighbours: 3
+
+  # Feature bagging - the random subspace method, applied to the whole detector.
+  #
+  # Each draw picks round(sqrt(d)) of the d value channels, builds a corpus from those channels
+  # alone, fits a metric to it, calibrates it and searches with it. A point's vote count is how
+  # many draws flagged it, and the verdict is votes >= `votes`, where 1 is exactly the union.
+  #
+  # This is *not* another `method`. The other detectors differ in the question they ask of one
+  # corpus; bagging changes the corpus itself - a draw signs different channels, so its terms are
+  # different quantities and its whitening lives in a different space. Nothing is comparable
+  # between draws except the rasterised verdicts, which is why the aggregation is over masks.
+  # Each draw uses whatever `method` above says, so the two compose.
+  #
+  # Why it should help. A metric fitted on all d channels dilutes an anomaly that lives in a few
+  # of them. Measured on SMD machine-1-1, where the interpretation labels say each anomaly
+  # implicates 7 to 31 of the 38 channels: 30 draws of 6 channels gave a union F1 of 0.521
+  # against 0.398 and 0.423 for the single full-width detectors. Individual draws ran 0.015 to
+  # 0.583, and that spread is the mechanism - the vote aggregates draws that happened to contain
+  # the affected channels with draws that missed them entirely.
+  #
+  # It is also a smaller problem per draw. Signature dimension is roughly width ** trunc, so
+  # C-MAPSS's 24 channels plus time give 650 terms, while a draw of round(sqrt(24)) = 5 channels
+  # plus time gives 6 + 36 = 42 - and better conditioned: on SMD the per-draw retained rank ran
+  # 4 to 15 against a full-width fit that needed heavy truncation.
+  #
+  # NOT yet measured on C-MAPSS, where the argument is weaker: 24 channels rather than 38, and a
+  # single fault mode. The SMD numbers above are the only evidence.
+  bagged:
+    # Draws to combine; -1 switches the stage off, matching window.size and umap.dimension.
+    # Each is an independent corpus, metric, calibration and search, so cost scales with this.
+    draws: -1
+    # Channels per draw; null is round(sqrt(d)), the random subspace default.
+    features: null
+    # Votes a point needs to be flagged. 1 is the union and was the best F1 on SMD; higher
+    # values trade recall for precision, and adjusted F1 kept climbing to v = 11 there. Note
+    # that at v = 1 the voting apparatus is doing nothing an OR would not - `votes` is best read
+    # as a precision/recall dial rather than as the thing that makes bagging work.
+    votes: 1
+    # Seed for the channel draws. Each draw also offsets the calibration seed by its own number,
+    # so two draws that happened to pick the same channels still fold differently.
+    random_state: 0
+
+  forest:
+    # Which coordinates the forest cuts on. This is not a tuning detail: a forest splits on
+    # axes, so unlike Mahalanobis distance it is *not* invariant to rotation, and the basis is
+    # a real choice. Measured, rotating the raw corpus into principal coordinates at full
+    # numerical rank - discarding nothing - costs F1 0.813 -> 0.668, while then truncating 356
+    # directions to the 11 that metric.variance_keep retains costs only 0.020 more. The raw
+    # signature axes are a good basis because each is a specific iterated integral, where a
+    # principal direction is a mixture of hundreds of them.
+    #
+    #   whitened  signature @ Sigma^-1/2, the vectors the FAISS index would hold. Conservative
+    #             - 10.25% of points flagged against a true rate of 15.03% - and the best
+    #             adjusted F1 measured anywhere in this project, 0.968. Pick this to answer
+    #             "was each failure caught at all".
+    #   raw       the signature as computed. Best plain F1, 0.813, flagging 19.27%. Pick this
+    #             to maximise point-wise overlap.
+    space: whitened
+    n_estimators: 200
+    # Points per tree. `auto` is min(256, n_samples), which is what the measurements used.
+    max_samples: auto
+
+  # How each depth band is structured for searching. This is a query-time choice, not a
+  # property of the stored artifact: the index on disk is a flat vector store either way, and
+  # the band views are built on load, so switching costs a reload rather than a rebuild.
+  #
+  #   exact  IndexFlatL2. Brute force, no training, the true nearest neighbour every time.
+  #   ivf    IndexIVFFlat. k-means into `nlist` cells, searching the `nprobe` nearest.
+  #   hnsw   IndexHNSWFlat. A navigable small-world graph. No training, no clustering.
+  #
+  # All three store vectors in full, so reported distances are exact; what becomes approximate
+  # under the latter two is *which* neighbours are found. That error is directional - a missed
+  # nearest neighbour can only inflate a distance, never shrink it - so an approximate index
+  # biases toward over-flagging, and a threshold calibrated under one setting does not
+  # transfer to another. Recalibrate if you change this.
+  #
+  # Prefer hnsw over ivf if you need speed. This index is searched *after* whitening, and
+  # Sigma^-1/2 gives the corpus unit variance in every retained direction by definition - which
+  # removes exactly the anisotropy k-means needs to find separable cells. HNSW navigates the
+  # vectors' own neighbour relations instead, and those survive whitening intact.
+  index:
+    type: exact          # exact | ivf | hnsw
+    # ivf only. nlist defaults to 4*sqrt(n); both are capped at what the band can train.
+    nlist: null
+    nprobe: 8
+    # hnsw only. ef_search is the recall knob - raise it to explore more of the graph.
+    hnsw_m: 32
+    ef_construction: 200
+    ef_search: 64
+  # Where each candidate interval's reference set and metric come from. Both modes run the
+  # same widest-first dyadic search - test the whole interval, bisect only where a test
+  # fails, then extend the boundaries of whatever came back clean - and differ only in the
+  # characteristic function that search calls.
+  #
+  #   pooled        One corpus of every dyadic interval of every fit window, whitened once
+  #                 by a single global Sigma^-1/2 and searched by depth band. Scoring is one
+  #                 FAISS query. A candidate is matched to corpus intervals of similar
+  #                 *width* from any position in any window: position is discarded and width
+  #                 is quantised to powers of two, so a 2-point query can be judged against
+  #                 12-point intervals.
+  #
+  #   per_interval  The reference set is rebuilt from the fit windows restricted to the
+  #                 candidate's own [lo, hi], and the metric refitted to it, so an interval
+  #                 is judged only against intervals of exactly its width and position. An
+  #                 exact match, but from far fewer vectors - one per fit window - which is
+  #                 why `metric.variance_keep` matters more here.
+  #
+  # Across all 28 SMD machines per_interval led on mean point-wise F1 (0.205 vs 0.189),
+  # median (0.168 vs 0.119) and mean adjusted F1 (0.446 vs 0.393), winning on 17 machines to
+  # 10. The advantage is calibration rather than representation: its median flagged fraction
+  # was 1.6x the true anomaly rate against pooled's 3.6x. It is the more conservative of the
+  # two, which helps where pooled over-flags and hurts where it already under-flags, and
+  # costs ~90s per machine against ~20s.
+  #
+  # Note a four-machine sample reversed this ordering, so treat any comparison of the two on
+  # a handful of streams as unmeasured.
+  mode: pooled
+
+  # Off-manifold test. null switches it off; a fraction in (0, 1) is the threshold. SigMahaKNN
+  # uses 1e-3.
+  #
+  # The problem it addresses. `metric.form: inv_sqrt` is built from a pseudo-inverse, which
+  # annihilates directions the corpus has no variance in - so an interval that moves *only* in
+  # such a direction scores near zero, however unlike the corpus it is. Measured here: a dead
+  # channel driven to a raw signature spread of 2.52 still produced whitened distances of
+  # 0.2-0.8, indistinguishable from ordinary variation. The reasoning that movement in a channel
+  # the corpus never moved in is by definition anomalous is right; the quadratic form simply
+  # cannot express it.
+  #
+  # How it is answered. SigMahaKNN's `Mahalanobis.calc_distance` runs a separate residual test
+  # before the quadratic form: take the difference between the query and the corpus point it
+  # matched, and measure what fraction of its norm survives projection out of the corpus row
+  # space, rho = ||x - x V^T V|| / ||x||. Above the threshold the distance is infinite. Note
+  # SigNova does *not* do this - it uses a plain pinv, as this pipeline did.
+  #
+  # Which subspace. V here is the *numerically* non-zero row space, not the one metric.
+  # variance_keep retains. Those are very different: variance_keep leaves 11 directions of 650
+  # on C-MAPSS, and testing against 11 would call nearly every interval off-manifold, since the
+  # discarded directions are ordinary corpus variation. The `covariance` rule writes the
+  # numerical-rank basis separately for this.
+  #
+  # What it costs. The test needs the corpus vectors as they were before whitening - Sigma^-1/2
+  # projects onto the retained subspace and destroys exactly the component being looked for - so
+  # `index` stores a second copy of the corpus when this is on. On a wide corpus that is
+  # hundreds of MB, which is why it is paid only when the test is armed.
+  #
+  # In the vocabulary of Nathan, Nikolaou & Lahav (2025), this is the *off-manifold* detector
+  # and the nearest-neighbour distance is the *on-manifold* one; they catch disjoint classes of
+  # anomaly, and their argument is that you want both on the same manifold.
+  off_manifold: null
+
+  band: 1
+  # Resolution floor as a power of two, in points: sig_tol 2 means the search never tests
+  # an interval narrower than 4 points and so cannot localise anything shorter.
+  sig_tol: 2
+  # Boundary extension step, as a power of two. The Omni notebook used 2 (a 4-point step);
+  # 0 steps one point at a time, which localises more finely and costs more candidates.
+  tol: 0
+  # Cap on searchable corpus intervals; null for no cap. pooled only. Sampled stratified
+  # across depths, since sampling uniformly would thin the shallow depths - only a handful of
+  # intervals per stream - out of existence long before the deep ones felt it.
+  nn_reference_size: null
+  # Seed for that subsampling, so an index is reproducible. Irrelevant when there is no cap.
+  random_state: 0
+
+  # per_interval only. The reference set at [lo, hi] depends on the interval alone and not on
+  # which window is being searched - every window shares one index space - so each distinct
+  # interval is built once and memoised, and this caps how many are held. The search visits
+  # far fewer distinct intervals than it evaluates candidates (685 builds against 3,214
+  # queries on SMD machine-1-1, a 79% hit rate), which is what makes the mode affordable
+  # rather than one covariance fit per query.
+  per_interval:
+    cache_size: 2048
+
+# --- evaluation ------------------------------------------------------------------------
+evaluate:
+  # Whether to score the detector against ground truth at all.
+  #
+  # Off, the pipeline still runs end to end and still reports what it *did* - which streams
+  # carried a flag, how much of each was flagged, what every stage cost - and the report shows
+  # that per-stream summary alone. Nothing is measured against labels: no precision, recall or
+  # F1, no range-based AD levels, no areas, and the two stages that exist only to feed them
+  # (`point_scores` and `operating_points`) leave the DAG entirely.
+  #
+  # That separation is the point. Detection and evaluation are different activities: a fleet
+  # being monitored in earnest has no labels, and a pipeline that cannot run without them is not
+  # a detector, it is a benchmark harness. Keeping the switch explicit means a run with labels
+  # present but metrics off is a deliberate choice rather than an accident of configuration.
+  #
+  # Requires `labels`. Asking for metrics without ground truth is a mistake worth catching
+  # rather than silently reporting nothing.
+  metrics: true
+
+  # Ground truth for the metrics, or null for plots only. One row per stream carrying either
+  # an `anomalous` column of [[lo, hi], ...] intervals - the same convention score writes - or
+  # a `label` column of 0/1 the length of the stream. Both are accepted.
+  labels: data/labels/cmapss_fd001_labels.parquet
+
+  # A second scoring pass that gives every point a continuous score, so that ROC-AUC and PR-AUC
+  # can be computed. Its own stage, `point_scores`, which drops out of the DAG when `window` is
+  # null.
+  #
+  # Why it is needed at all. `score` answers a decision - which points are anomalous - and emits
+  # intervals. An area under a curve summarises a detector over *every* threshold, and a binary
+  # flag has already had one applied and thrown the rest away. The area under the three-point
+  # curve a binary predictor traces is (1 + TPR - FPR)/2, which is balanced accuracy under
+  # another name: 0.709 on FD001, against 0.976 for the same detector scored continuously.
+  #
+  # Why a separate pass rather than the search's own trace. The widest-first search subdivides
+  # only where a test fails, so which intervals it scores depends on the threshold - and an area
+  # computed from that trace would move when the threshold moved, which is exactly the
+  # dependence a ranking metric exists to remove.
+  #
+  # What it costs. More than `score`, not less: the search gets away with a few thousand queries
+  # for tens of thousands of points precisely because it stops subdividing where a wide interval
+  # passes, and scoring every point cannot. On FD001 that is ~20,000 windows against 2,564
+  # interval queries. Raise `stride` if that is too slow.
+  point_scores:
+    # Increments spanned by the sliding window; null switches the stage off. This is a property
+    # of the measurement, not a tuning knob - a wider window is a smoother, easier question - so
+    # hold it fixed across anything you intend to compare. 8 is half of `window.size` and lands
+    # at depth 1 on the dyadic grid granularity 3 lays down.
+    window: 8
+    # Increments between window ends. 1 scores every point directly; larger strides let
+    # neighbouring points share a score and cost proportionally less.
+    stride: 1
+
+  # The other way to get an area, and a different question. `point_scores` above measures the
+  # *representation* - how well the score orders anomalous points above normal ones, with the
+  # search factored out. This re-runs the *real detector* at scaled thresholds and integrates
+  # the (false positive rate, true positive rate) pairs it traces, which measures the deployed
+  # system: score, widest-first search and per-depth calibration together.
+  #
+  # It is a legitimate ROC curve rather than an approximation of the other, because the flagged
+  # sets are nested in the threshold - if an interval is clean at t1 < t2 then at t2 the search
+  # declares either it or an ancestor covering it clean, and boundary extension only grows clean
+  # regions - so raising the threshold can only remove flags, which is the condition a monotone
+  # curve needs.
+  #
+  # What it costs is the reason it is not the default: every point on the curve is a complete
+  # search over every test stream, roughly 25 s on FD001 and 150 s on FD004, against about 20 s
+  # for the single pass that yields the whole ranking curve exactly.
+  operating_points:
+    # Multipliers applied to every calibrated per-depth threshold; empty or null switches the
+    # stage off. Needs evaluate.labels, since a curve through the ROC plane cannot be traced
+    # without ground truth.
+    #
+    # Every depth is scaled by a common factor, which keeps the relative weighting calibration
+    # chose and moves only how permissive the detector is overall. That is a choice - the
+    # thresholds are a table, not a scalar, so a sweep has to pick a path through that space -
+    # and it is the natural one. 1.0 is the calibrated setting itself, so the deployed operating
+    # point appears on the same curve as the hypothetical ones.
+    scales: [0.1, 0.25, 0.5, 1.0, 2.0, 4.0, 10.0]
+  # Also draw streams with nothing flagged. Off by default: on a run of any size they are the
+  # overwhelming majority, and a directory of flat lines buries the few plots worth looking
+  # at. Turn on when the clean streams are the point - checking for false negatives.
+  plot_clean_streams: false
+  # Cap on figures drawn, most severe first by ratio. null for no cap.
+  max_plots: 25
+  # Value channels drawn per stream. Multivariate streams can carry dozens; the figure is a
+  # way in, not a complete record.
+  max_channels: 5

@@ -1,0 +1,45 @@
+# Per-interval anomalies-at-scale workflow.
+#
+# Pinned loosely, as the parent project is, but the set differs from it in two ways worth
+# noting rather than silently inheriting.
+
+numpy
+pandas
+matplotlib
+iisignature
+
+# Reading and writing parquet. The parent leaves this implicit through pandas; it is named
+# here because the corpus format is not optional in this workflow - windows are read back
+# thousands of times during a single detect run.
+pyarrow
+
+# Nearest-neighbour search. Present in the parent's environment but absent from its
+# requirements.txt, which is a gap rather than a decision.
+#
+# This workflow leans on it far less than the pooled one: there is no large persisted index,
+# only a small flat index rebuilt per interval over a few hundred vectors. If the dependency
+# is ever unwelcome, a direct distance computation would be a reasonable substitute at these
+# sizes - which is not true of the pooled workflow.
+faiss-cpu
+
+# Workflow engine.
+snakemake
+pulp<2.8  # snakemake 7.x calls pulp.list_solvers, removed in pulp>=2.8
+
+# Fetching raw data.
+requests
+
+# Deliberately absent, unlike the parent's requirements.txt: fknni. Nothing in this workflow
+# imports it - it belongs to the NAB baseline comparisons, which live in the notebooks rather
+# than in either pipeline.
+
+# Needed only when umap.enabled, which is off by default. The per-interval detector then fits
+# a fresh projection at every interval, so this is imported inside the search rather than at
+# module scope and a run with the reduction off never touches it.
+#
+# scipy and scikit-learn come with it rather than separately: anomalies_scale.UMAP uses
+# StandardScaler, trustworthiness and NearestNeighbors from sklearn and procrustes from scipy.
+# umap-learn additionally pulls in numba and llvmlite, which pin numpy tightly.
+umap-learn
+scikit-learn
+scipy

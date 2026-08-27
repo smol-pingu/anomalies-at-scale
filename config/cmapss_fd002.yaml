@@ -1,0 +1,54 @@
+dataset: cmapss_fd002
+raw:
+  corpus_urls: []
+  test_urls: []
+  value_column: null
+  time_column: 1
+split:
+  base_fraction: 0.572
+umap:
+  dimension: -1
+  slicing: per_instant
+  n_neighbors: 15
+  min_dist: 0.1
+  alignment_window_size: 3
+  standardise: true
+  random_state: 0
+  cache_dir: data/projected/cache
+window:
+  size: 16
+signature:
+  normalise: false
+  normalise_method: zscore
+  trunc: 2
+  granularity: 3
+  stream_column: 0
+  format: parquet
+metric:
+  variance_keep: 0.999
+  form: inv_sqrt
+calibrate:
+  folds: 5
+  statistic: p95
+  random_state: 0
+detect:
+  index:
+    type: exact
+    nlist: null
+    nprobe: 8
+    hnsw_m: 32
+    ef_construction: 200
+    ef_search: 64
+  mode: pooled
+  band: 1
+  sig_tol: 2
+  tol: 0
+  nn_reference_size: null
+  random_state: 0
+  per_interval:
+    cache_size: 2048
+evaluate:
+  labels: data/labels/cmapss_fd002_labels.parquet
+  plot_clean_streams: false
+  max_plots: 25
+  max_channels: 5

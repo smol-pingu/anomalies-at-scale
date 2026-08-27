@@ -1,0 +1,31 @@
+# Conda environment for the per-interval anomalies-at-scale workflow.
+#
+# The pip section mirrors requirements.txt; conda carries the packages with compiled
+# components, where a wheel is either unavailable or awkward on Windows.
+
+name: anomalies-per-interval
+
+channels:
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.10
+  - numpy
+  - pandas
+  - matplotlib
+  - pyarrow
+
+  # From conda-forge rather than pip: the PyPI package is `faiss-cpu` while conda names it
+  # `faiss-cpu` too, but the conda build links a prebuilt BLAS and avoids the compiler
+  # toolchain that the source distribution otherwise needs on Windows.
+  - faiss-cpu
+
+  - snakemake-minimal>=7,<8
+  - pulp<2.8            # snakemake 7.x calls pulp.list_solvers, removed in pulp>=2.8
+  - requests
+
+  - pip
+  - pip:
+      # No conda-forge build, so it comes from PyPI in every case.
+      - iisignature

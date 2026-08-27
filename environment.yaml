@@ -1,0 +1,66 @@
+# Conda environment for the pooled anomalies-at-scale workflow.
+#
+# Built from the working .venv rather than written by hand, so these are versions the pipeline
+# has actually run under, not ones it ought to work with.
+#
+#   conda env create -f environment.yaml
+#   conda activate anomalies-at-scale
+#
+# The Snakefile makes the package importable with `sys.path.insert(0, .../src)`, so no install
+# step is needed - activating this and running `snakemake` from the project root is enough.
+#
+# Note that no rule carries a `conda:` directive, so `--use-conda` currently does nothing. This
+# file describes the environment you run the workflow *in*, not one Snakemake will build.
+name: anomalies-at-scale
+
+channels:
+  - conda-forge
+
+dependencies:
+  # 3.10 is what the venv runs. Not a hard floor, but umap-learn pulls in numba and llvmlite,
+  # which are the packages most likely to lag on a newer Python.
+  - python=3.10
+
+  # --- the numpy 2 constraint -------------------------------------------------------------
+  # This is the one pin that is load-bearing rather than incidental. faiss-cpu 1.15.0 is built
+  # against the numpy 2 ABI and fails at import with `No module named 'numpy._core'` under
+  # numpy 1.x - not a version warning, a hard failure of the package the whole index rests on.
+  #
+  # Learned by breaking it: installing the PATE metric package pins numpy<2 and silently
+  # downgraded the environment, taking faiss with it. If a dependency ever demands numpy<2,
+  # it belongs in a separate environment, not this one.
+  - numpy>=2.0
+  - pandas>=2.1
+  # umap-learn 0.5.12 requires >=1.6; the same PATE install dropped it to 1.3.2 and broke it.
+  - scikit-learn>=1.6
+  - scipy>=1.15
+  - matplotlib>=3.9
+  # Parquet engine. Every artifact between stages is parquet - canonical streams, corpora,
+  # scored output - so this is not optional.
+  - pyarrow>=15
+  - requests>=2.31
+
+  # Snakemake 7.x calls pulp.list_solvers, which was removed in pulp 2.8.
+  - snakemake=7.32.4
+  - pulp<2.8
+
+  # --- development ------------------------------------------------------------------------
+  - jupyterlab>=4
+  - pytest>=8
+
+  - pip
+  - pip:
+      # Not on conda-forge for this platform, or only reliably current on PyPI.
+      #
+      # faiss-cpu: the index. See the numpy note above before changing its version.
+      - faiss-cpu==1.15.0
+      # iisignature: every signature in this project is computed by this, including the
+      # base-pointing. esig is present only because sktime pulled it in during an experiment
+      # that was reverted - nothing imports it now.
+      - iisignature==0.24
+      # umap-learn: only needed when umap.dimension is positive, which is off by default. It
+      # drags in numba and llvmlite, which pin numpy tightly - the reason the Snakefile imports
+      # anomalies_scale.UMAP lazily rather than at the top.
+      - umap-learn==0.5.12
+      # pysegments: the widest-first interval search this project's detector is modelled on.
+      - pysegments==0.3

@@ -1,0 +1,62 @@
+# What this repository tracks is the pipeline: source, configuration, workflow, notebooks and
+# tests. Everything below is either derived from those, obtainable elsewhere, or someone else's.
+#
+# The distinction that matters is not size but *provenance*. A 769 MB corpus parquet is excluded
+# because `snakemake` rebuilds it from data/raw, not merely because it is large - and GitHub
+# rejects any single file over 100 MB regardless, which several of them exceed.
+
+# --- environment ---------------------------------------------------------------------------
+.venv/
+env/
+venv/
+
+# --- third-party repositories, vendored into this tree -----------------------------------
+# Complete repositories with their own licences. Clone them separately rather than
+# redistributing them inside this one.
+NAB-master/
+OmniAnomaly-master/
+
+# --- third-party papers ----------------------------------------------------------------------
+# Reference PDFs. Copyright is not ours to redistribute, and it is 11 MB of it.
+# Note this also excludes the extracted project brief kept alongside them - move that out if you
+# want it versioned.
+Project Files/
+
+# --- data --------------------------------------------------------------------------------
+# Everything under data/ is either a raw input obtainable from its source (see README) or an
+# artifact the workflow rebuilds. `data/raw` is excluded with the rest: it is 265 MB of public
+# C-MAPSS text files that are not ours to host.
+data/
+CMAPSS/
+
+# Superseded covariance matrices, parked under legacy/ during the move to npz. 712 MB, and
+# regenerable - the rest of legacy/ is source and stays tracked.
+legacy/covariance_csv/
+
+# --- run outputs -----------------------------------------------------------------------------
+# Rebuilt by any run. `benchmarks/` is deliberately NOT here: the TSVs are a few hundred bytes
+# each and they are the evidence behind the throughput numbers, so they are worth keeping.
+results/
+figures/
+reports/
+
+# --- workflow state --------------------------------------------------------------------------
+.snakemake/
+
+# --- python ------------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# --- editors and operating systems -------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*~
+Thumbs.db
+.DS_Store
+
+# --- secrets -------------------------------------------------------------------------------
+.env

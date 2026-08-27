@@ -1,0 +1,438 @@
+"""Per-interval anomalies-at-scale workflow - skeleton.
+
+    download -> [umap] -> preprocess -> detect -> evaluate
+
+The sibling workflow at the repository root implements the **pooled** detector: one corpus of
+every dyadic interval, whitened once by a single global ``Sigma^-1/2``, indexed once, and
+searched by depth band. Because those are durable artifacts, that workflow has a stage for
+each of them - corpus, covariance, index, calibrate - and eight in total.
+
+This workflow implements the **per-interval** detector, and the reason it needs only four
+stages is the whole architectural difference between the two. At each interval the corpus of
+normality is restricted to that interval, a covariance is fitted to it, a threshold is
+calibrated from it, and every stream still in question is tested against it. Corpus,
+covariance, index and threshold all still exist - there are simply one of each per interval,
+alive for the duration of that interval, and none is an artifact worth writing to disk.
+
+So `detect` is not a thinner stage than the pooled workflow's `score`; it is that stage with
+four others folded inside its inner loop.
+
+Interval-major, not stream-major
+--------------------------------
+The search walks the dyadic tree once, and at each node builds the model once and tests every
+stream still active there against it. Building the model is the expensive step and does not
+depend on which stream is being tested, so ordering the work this way means each distinct
+interval is built exactly **once**, with no cache and nothing to re-derive.
+
+The other half of that is early exit. A stream shown to be normal over an interval leaves the
+search there, so the work at each level shrinks as streams are resolved: a corpus of streams
+that are mostly clean costs little more than the root. In a synthetic six-stream test with two
+anomalies, the whole run built 15 interval models; with no anomalies at all, it built one.
+
+What it buys, and what to watch
+-------------------------------
+Every interval is judged only against normal data of exactly its own width and position,
+rather than against whatever a depth band admits.
+
+A per-interval metric of this kind was measured against the pooled one across all 28 SMD
+machines and led it on mean point-wise F1 (0.205 against 0.189) and by more on the median
+(0.168 against 0.119), winning on 17 machines to 10 - the advantage being calibration rather
+than representation. Those figures should be read as evidence for the *metric*, not as a
+prediction for this workflow, because the detector they came from reported the complement of
+what it found clean and this one reports only what it directly failed. See below.
+
+Three things to keep in view. The covariance at an interval is fitted from one signature per
+corpus stream, so it is far more rank-starved than a pooled corpus and `metric.variance_keep`
+matters correspondingly more. The threshold at each interval is a statistic over the withheld
+fraction of the corpus - 5% by default, which is very few streams - so it is a noisy estimate
+wherever the corpus is small.
+
+And the reporting convention differs from the pooled workflow's, which has a consequence
+worth knowing. The pooled search reports every region it did not prove clean; this one reports
+only regions it directly proved anomalous. A stream can therefore fail at a coarse interval,
+be refined, and have every descendant pass - in which case nothing is written out at all.
+That is sometimes correct (a noisy threshold flagged the whole span spuriously, and refinement
+cleared it) and sometimes a loss (a diffuse departure visible only at width). Both have been
+reproduced on synthetic data, and the output cannot presently tell them apart, because a
+coarse failure that refinement clears leaves no record.
+
+`download` is shared with the pooled workflow, and `detect` is implemented. `preprocess` and
+`evaluate` are placeholders: their `run:` blocks raise through :func:`placeholder` naming what
+they are meant to produce, while still declaring inputs and outputs so the DAG is real.
+"""
+
+import sys
+from pathlib import Path
+
+from snakemake.exceptions import WorkflowError
+
+configfile: "config/config.yaml"
+
+# The signature and search machinery is shared with the pooled workflow rather than
+# duplicated - only the detector differs, and a second copy of Chen's identity would be a
+# second thing to keep correct.
+sys.path.insert(0, str(Path(workflow.basedir).parent / "src"))
+
+from anomalies_scale.download_corpus import download_target, raw_files
+from anomalies_scale.evaluation import evaluate_scores
+from anomalies_scale.interval_detection import detect
+from anomalies_scale.preprocessing import preprocess_streams
+
+DATASET = config["dataset"]
+
+
+def latent_dimension(value):
+    """Read `umap.dimension`: -1 for off, or the size of the latent space.
+
+    Rejects 0 rather than reading it as "off". One number carrying both the switch and the size
+    is only unambiguous if the off value is unmistakable, and a zero-dimensional latent space is
+    not something anyone means to request - so it is far more likely a typo than an intention,
+    and guessing which would be worse than stopping.
+    """
+    dimension = int(value)
+    if dimension == 0 or dimension < -1:
+        raise WorkflowError(
+            "umap.dimension is {0}; expected -1 to switch the reduction off, or a positive "
+            "number of latent channels.".format(dimension))
+    return None if dimension < 0 else dimension
+
+
+#: Latent channels, or None for no reduction. Identical in meaning and effect to the pooled
+#: workflow's: one projection fitted on the corpus, both sides transformed, and `detect` then
+#: runs on latent streams without knowing it. Nothing is refitted inside the search.
+UMAP_DIMENSION = latent_dimension(config.get("umap", {}).get("dimension", -1))
+USE_UMAP = UMAP_DIMENSION is not None
+
+def umap_slicing(value):
+    """Read `umap.slicing`: which axis the alignment runs along.
+
+    Not a tuning parameter. Each value asserts something different about the corpus, and the
+    diagnostics the stage writes are what tell you whether the assertion holds - see
+    `anomalies_scale.UMAP.project_corpus_and_test`.
+    """
+    if value not in SLICINGS:
+        raise WorkflowError(
+            "umap.slicing is {0!r}; expected one of {1}.".format(value, list(SLICINGS)))
+    return value
+
+
+# Imported only when the reduction is on: umap-learn pulls in numba and llvmlite, which cost
+# seconds to import and are an unnecessary dependency for a run that leaves it switched off.
+if USE_UMAP:
+    from anomalies_scale.UMAP import SLICINGS, project_corpus_and_test
+    UMAP_SLICING = umap_slicing(config.get("umap", {}).get("slicing", "per_stream"))
+else:
+    UMAP_SLICING = None
+
+#: Two ways, not three. The pooled workflow splits fit/withheld/test because its threshold is
+#: calibrated once, against a set held out for the purpose. Here the train/withhold split is
+#: made *inside* `detect`, freshly at every interval, so splitting again out here would only
+#: mean splitting twice and calibrating each interval on a smaller sample than it could have.
+SPLITS = ["corpus", "test"]
+
+RAW = "data/raw/{dataset}/{side}/{name}"
+
+#: Both sides in latent coordinates, plus the fitted projection. Only built when the reduction
+#: is on. Identical layout to the pooled workflow's, because it is the same stage.
+PROJECTED_CORPUS = "data/projected/{dataset}/corpus"
+PROJECTED_TEST = "data/projected/{dataset}/test"
+PROJECTION = "data/projected/{dataset}_projection.pkl"
+PROJECTION_DIAGNOSTICS = "data/projected/{dataset}_projection.json"
+
+WINDOWS = "data/preprocessed/{dataset}_{split}"
+CORPUS_WINDOWS = WINDOWS.replace("{split}", "corpus")
+TEST_WINDOWS = WINDOWS.replace("{split}", "test")
+
+#: What `preprocess` decided, as readable JSON beside the sets it wrote. Not an output of the
+#: rule: making it one would mean Snakemake deleted it on failure, and the case where you most
+#: want to know which streams were discarded is the run that then fell over.
+PREPROCESS_SUMMARY = "data/preprocessed/{dataset}_preprocess.json"
+
+SCORES = "results/{{dataset}}_scores.{0}".format(config["output"]["format"])
+INTERVALS = "results/{{dataset}}_intervals.{0}".format(config["output"]["format"])
+SUMMARY = "results/{{dataset}}_summary.{0}".format(config["output"]["format"])
+FIGURES = "figures/{dataset}"
+
+#: Written by `detect` alongside the scores: how many interval models were built, how many
+#: stream-tests they served, where streams were resolved, and the mean retained rank. With the
+#: metric rebuilt at every interval and never persisted, this is the only visibility into
+#: whether it was well posed.
+DETECT_DIAGNOSTICS = "results/{dataset}_detect_diagnostics.json"
+
+
+def side_urls(side):
+    """Configured URLs for one side. Empty means 'already on disk, or to be split out'."""
+    return config["raw"].get("{0}_urls".format(side)) or []
+
+
+#: What each side will produce, resolved once so the DAG knows its files up front.
+CORPUS_FILES = raw_files(side_urls("corpus"), "corpus", DATASET)
+TEST_FILES = raw_files(side_urls("test"), "test", DATASET)
+
+
+def corpus_input():
+    """What `preprocess` reads for the corpus side: latent streams, or the raw files."""
+    return PROJECTED_CORPUS if USE_UMAP else CORPUS_FILES
+
+
+def test_input():
+    """What `preprocess` reads for the test side. Both sides go through one projection."""
+    return PROJECTED_TEST if USE_UMAP else TEST_FILES
+
+
+#: The same refusal the pooled workflow makes, for the same reason: a time-grouped projection
+#: has a mapper per instant, so a test period living inside the corpus series would be fitted on.
+#: Only the time-grouped slicing has this problem. Under `per_stream` a whole stream is placed
+#: through one mapper, so `fit_fraction` can restrict what is *learnt* to the leading portion
+#: while still transforming the full series - which is exactly how that path avoided the leak.
+UMAP_NEEDS_TEST_FILES = USE_UMAP and not TEST_FILES and UMAP_SLICING == "per_instant"
+
+if UMAP_NEEDS_TEST_FILES:
+    # Warned here, raised inside the rule. A configuration this cannot execute should still
+    # be inspectable with `snakemake -n`.
+    sys.stderr.write(
+        "WARNING: umap.dimension is {0} but raw.test_urls is empty. The `umap` stage will "
+        "refuse to run - see the message it raises for why.\n".format(UMAP_DIMENSION))
+
+
+def placeholder(rule_name, intent, outputs, reads=()):
+    """Fail with an explanation of what this stage is for, rather than silently doing nothing."""
+    outputs = [outputs] if isinstance(outputs, str) else list(outputs)
+    message = [
+        "rule '{0}' is a placeholder and has no implementation yet.".format(rule_name),
+        "  It should {0}.".format(intent),
+        "  Expected output: {0}".format(", ".join(str(o) for o in outputs)),
+    ]
+    if reads:
+        message.append("  Config it will read: {0}".format(", ".join(reads)))
+    raise WorkflowError("\n".join(message))
+
+
+# ---------------------------------------------------------------------------------------
+rule all:
+    """Default target: the full chain, ending at the evaluation."""
+    input:
+        expand(INTERVALS, dataset=DATASET),
+        expand(SUMMARY, dataset=DATASET),
+        expand(FIGURES, dataset=DATASET),
+
+
+rule download:
+    """Stage 1 of 4. Fetch one raw file.
+
+    Identical to the pooled workflow's, and shares its implementation rather than copying it:
+    both call `download_corpus.download_target`. Nothing about fetching raw data depends on
+    which detector will eventually read it.
+
+    Corpus and test data are configured as two separate lists of URLs, and every URL becomes
+    its own job, so a dataset spread over many files - one per machine, say - downloads in
+    parallel and a failure part-way through only costs the files that had not arrived.
+
+    Leaving a list empty is legitimate: place the files under `data/raw/{dataset}/{side}/`
+    yourself and they are picked up from there. An empty `test` list additionally means the
+    test period should be cut out of the corpus series by `preprocess`.
+    """
+    output:
+        RAW,
+    wildcard_constraints:
+        side="corpus|test",
+    run:
+        download_target(output[0], side_urls(wildcards.side),
+                        wildcards.side, wildcards.name)
+
+
+rule umap:
+    """Stage 1b of 4, and only in the DAG when `umap.dimension` is positive.
+
+    Fits one aligned embedding per instant on the corpus of normality, then transforms both
+    the corpus and the test streams into that latent space. Pure preprocessing: `detect` reads
+    the result and never learns a reduction happened, and nothing is refitted inside its search.
+
+    That last point is the change from the earlier design, which rebuilt a projection at every
+    interval alongside the covariance and threshold. It was consistent with the rest of this
+    detector but it multiplied the cost of the most repeated operation in the method, and the
+    projection it produced at each interval was discarded immediately.
+    """
+    input:
+        corpus=CORPUS_FILES,
+        test=TEST_FILES,
+    output:
+        corpus=directory(PROJECTED_CORPUS),
+        test=directory(PROJECTED_TEST),
+        projection=PROJECTION,
+        diagnostics=PROJECTION_DIAGNOSTICS,
+    run:
+        if UMAP_NEEDS_TEST_FILES:
+            raise WorkflowError(
+                "umap.dimension is {0}, but raw.test_urls is empty.\n"
+                "  A time-grouped projection fits one embedding per instant and can only "
+                "transform a stream at instants it has a mapper for. With no separate test "
+                "data the test period is a suffix of the corpus series, so fitting those "
+                "instants means fitting on the data the detector will be asked to judge.\n"
+                "  Supply test data separately, or set umap.dimension to -1."
+                .format(UMAP_DIMENSION))
+
+        project_corpus_and_test(
+            UMAP_SLICING,
+            corpus_files=input.corpus,
+            test_files=input.test,
+            projection_path=output.projection,
+            corpus_dir=output.corpus,
+            test_dir=output.test,
+            diagnostics_path=output.diagnostics,
+            n_components=UMAP_DIMENSION,
+            n_neighbors=config["umap"]["n_neighbors"],
+            min_dist=config["umap"]["min_dist"],
+            standardise=config["umap"]["standardise"],
+            random_state=config["umap"]["random_state"],
+            alignment_window_size=config["umap"]["alignment_window_size"],
+            cache_dir=config["umap"]["cache_dir"] or None,
+            time_col=config["raw"]["time_column"],
+            value_cols=config["raw"]["value_column"],
+            stream_col=config["signature"]["stream_column"],
+            show_progress=True,
+        )
+
+
+rule preprocess:
+    """Stage 2 of 4. Name, screen and divide.
+
+    Everything between the raw files and a set of streams ready to sign: column naming,
+    screening out streams that cannot be signed, and the corpus/test division. It does not
+    cut windows - streams arrive as streams.
+
+    The same stage as the pooled workflow's, reading the same configuration keys and calling
+    the same code in `anomalies_scale.preprocessing`. Nothing about turning raw files into
+    windows depends on which detector consumes them - the two differ only in how many splits
+    they ask for, since this workflow calibrates from a split made inside `detect`.
+
+    Channels that never move are deliberately **kept**. Whether their noise is then visible
+    is decided by `metric.variance_keep`, not here - see the note in the configuration.
+
+    Note the two shapes of input this has to cope with. When `test` raw files are present the
+    corpus/test division is already made and only fit/withheld remains to be cut; when they
+    are absent the test period must be taken off the end of the corpus series using
+    `split.base_fraction`. Both are split by position rather than at random - these are time
+    series, and windows overlap, so a random split would put windows covering the same
+    timestamps on either side of a boundary.
+
+    One requirement this workflow imposes that the pooled one does not: every stream must be
+    the same length, on one shared index space, because `detect` slices them all to a common
+    ``[lo, hi]``. Nothing guarantees that now that windows are not being cut, so
+    `load_stream_set` checks it and raises - streams of differing lengths are a data problem
+    to fix upstream rather than something the pipeline can paper over.
+    """
+    input:
+        corpus=corpus_input(),
+        test=test_input(),
+    output:
+        corpus=directory(CORPUS_WINDOWS),
+        test=directory(TEST_WINDOWS),
+    run:
+        preprocess_streams(
+            input.corpus,
+            input.test,
+            corpus_dir=output.corpus,
+            test_dir=output.test,
+            base_fraction=config["split"]["base_fraction"],
+            time_col=config["raw"]["time_column"],
+            value_cols=config["raw"]["value_column"],
+            stream_col=config["signature"]["stream_column"],
+            summary_path=PREPROCESS_SUMMARY.format(dataset=DATASET),
+            show_progress=True,
+        )
+
+
+rule detect:
+    """Stage 3 of 4. Segment the test streams, rebuilding the model at every interval.
+
+    Widest first. At each interval, in order:
+
+    1. sign the whole corpus of normality restricted to that interval - in whatever channels
+       arrive, raw or latent, since the reduction happened upstream;
+    2. fit ``Sigma^-1/2`` to those signatures, rank-truncated by retained variance;
+    3. split the corpus 95/5, index the 95%, and take the configured statistic of the
+       withheld 5%'s distances as this interval's threshold;
+    4. score every stream still in question against that same 95% index;
+    5. streams at or below the threshold are normal here and leave the search; the rest
+       descend into the two halves.
+
+    The work is organised interval-major rather than stream-major, which is what makes it
+    affordable: building an interval's model is the expensive step and does not depend on
+    which stream is being tested, so it happens once per interval however many streams need
+    it. Each distinct interval is therefore built exactly once, with no cache, and a stream
+    clean over its whole span costs one test and is never descended into.
+    """
+    input:
+        corpus=CORPUS_WINDOWS,
+        test=TEST_WINDOWS,
+    output:
+        scores=SCORES,
+        diagnostics=DETECT_DIAGNOSTICS,
+    run:
+        detect(
+            sorted(Path(input.corpus).glob("*")),
+            sorted(Path(input.test).glob("*")),
+            output_path=output.scores,
+            diagnostics_path=output.diagnostics,
+            trunc=config["signature"]["trunc"],
+            sig_tol=config["detect"]["sig_tol"],
+            tol=config["detect"]["tol"],
+            variance_keep=config["metric"]["variance_keep"],
+            statistic=config["calibrate"]["statistic"],
+            withhold_fraction=config["calibrate"]["withhold_fraction"],
+            random_state=config["calibrate"]["random_state"],
+            time_col=config["raw"]["time_column"],
+            stream_col=config["signature"]["stream_column"],
+            # None switches the reduction off entirely and the raw channels are signed. When
+            # set, a fresh UMAP is fitted at every interval from the corpus restricted to it -
+            # there is no projection artifact to carry, because none outlives its interval.
+            show_progress=True,
+        )
+
+
+rule evaluate:
+    """Stage 4 of 4. Report the flagged intervals and draw the streams they came from.
+
+    The same stage as the pooled workflow's, calling the same code in
+    `anomalies_scale.evaluation`. The two detectors disagree about how to *find* an anomalous
+    interval, not about what one is, so `detect` emits the same schema the pooled workflow's
+    scoring stage does and one evaluation serves both.
+
+    One difference shows up in the output rather than the code. The pooled search reports the
+    complement of the blocks it found clean, so it can report a range it never tested as a
+    unit, and `evaluation` marks those `inconclusive`. This detector only ever records an
+    interval it tested directly and that failed, so its rows are all `anomalous`.
+    """
+    input:
+        scores=SCORES,
+        windows=TEST_WINDOWS,
+    output:
+        intervals=INTERVALS,
+        summary=SUMMARY,
+        figures=directory(FIGURES),
+    run:
+        evaluate_scores(
+            input.scores,
+            sorted(Path(input.windows).glob("*")),
+            output_path=output.intervals,
+            summary_path=output.summary,
+            figures_dir=output.figures,
+            plot_clean=config["evaluate"]["plot_clean_streams"],
+            max_plots=config["evaluate"]["max_plots"],
+            max_channels=config["evaluate"]["max_channels"],
+            time_col=config["raw"]["time_column"],
+            stream_col=config["signature"]["stream_column"],
+            show_progress=True,
+        )
+
+
+rule clean:
+    """Remove every derived artifact, leaving data/raw untouched."""
+    run:
+        import shutil
+
+        for path in ("data/projected", "data/preprocessed", "results", "figures"):
+            if Path(path).exists():
+                shutil.rmtree(path)
+                print("removed", path)
