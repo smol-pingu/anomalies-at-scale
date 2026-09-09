@@ -56,6 +56,7 @@ import iisignature
 
 from anomalies_scale.anomaly_detection_pooled import invert_clean, widest_first_segment
 from anomalies_scale.canonical_streams import iter_streams
+from anomalies_scale.covariance_creation import retained_rank, spectrum
 from anomalies_scale.signature_computer import add_base_point, write_corpus
 
 #: Columns of the returned table - the same schema, and the same reporting convention, as the
@@ -116,6 +117,31 @@ def sign_interval(paths, lo, hi, trunc):
     so restricting them all to an interval is a slice.
     """
     return sign_slice(paths[:, lo:hi + 1, :], trunc)
+
+
+def fit_projection(corpus_signatures, variance_keep=0.999):
+    """The whitening at one interval, as an ``(n_terms, rank)`` projection.
+
+    ``Sigma^-1/2`` is never formed. A per-interval detector fits one metric for every distinct
+    interval the search visits, and a dense ``n_terms x n_terms`` matrix each time would dominate
+    both the memory and the arithmetic - at 650 terms that is 3.4 MB per interval, and the point
+    of this detector is that there are hundreds of them. The rank-*r* factor is what the distance
+    actually needs: whitening is ``X @ projection`` into *r* latent coordinates, and Euclidean
+    distance there is Mahalanobis distance in the original space.
+
+    Returns
+    -------
+    (np.ndarray, int)
+        The ``(n_terms, rank)`` float32 projection, and the rank retained.
+    """
+    signatures = np.atleast_2d(np.asarray(corpus_signatures, dtype=float))
+    values, right, n_rows = spectrum(signatures)
+    rank = retained_rank(values, variance_keep)
+
+    # Sigma = V diag(s**2 / n) V.T, so Sigma^-1/2 = V.T diag(sqrt(n) / s) V; projecting onto the
+    # kept rows of V and scaling gives the same distances in r coordinates instead of D.
+    scale = np.sqrt(n_rows) / values[:rank]
+    return np.ascontiguousarray((right[:rank].T * scale).astype(np.float32)), int(rank)
 
 
 class IntervalModel:

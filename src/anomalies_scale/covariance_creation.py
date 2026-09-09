@@ -210,8 +210,31 @@ def spectrum(signatures, chunk_rows=200_000):
     return values, right, n_rows
 
 
-def retained_rank(values, variance_keep):
-    """How many leading components carry `variance_keep` of the corpus's variance.
+def retained_rank(values, variance_keep, rcond=None):
+    """How many leading components the metric keeps, by one of two rules.
+
+    `rcond` selects a **relative singular floor**: every direction whose singular value is at
+    least ``rcond * s_max``. `variance_keep` selects a **share of variance**: the leading
+    directions carrying that fraction. When both are given the floor wins, because it is the
+    one with the invariance the method rests on.
+
+    Which rule, and why it matters
+    ------------------------------
+    The Mahalanobis distance is invariant under non-degenerate linear maps of the data - that
+    is the property SigNova and SigMahaKNN rely on instead of normalising signatures at all,
+    and it is why neither rescales anything. But the invariance belongs to the *full* inverse
+    covariance. A share-of-variance cut is not invariant: rescale the data and the shares move,
+    so the rule keeps a different subspace and the distances change.
+
+    Measured on Exathlon, where one direction carries 59.5% of the variance and three carry
+    97.3%: `variance_keep=0.999` retained **4 directions of 16,275**, and the detector built on
+    it flagged every window it was shown. A relative floor at 1e-8 retained 36 of the same
+    spectrum. The share rule was not being conservative, it was reading a scale disparity as
+    though it were an information content.
+
+    A relative floor rather than SigMahaKNN's absolute `svd_thres = 1e-12`: an absolute
+    threshold is itself scale-dependent, and on this corpus - singular values from 2.1e+23 down
+    to 7.2e+06 - it keeps every direction including those estimated from a handful of rows.
 
     Never exceeds the numerical rank, so a corpus that is genuinely degenerate is not handed
     directions that are pure rounding error.
@@ -220,6 +243,8 @@ def retained_rank(values, variance_keep):
         raise ValueError("corpus has no variance in any direction")
 
     numerical_rank = int((values > 1e-12 * values.max()).sum())
+    if rcond is not None:
+        return min(int((values >= float(rcond) * values.max()).sum()), numerical_rank)
     if variance_keep is None:
         return numerical_rank
 
@@ -341,7 +366,7 @@ class Whitening:
         return float(np.abs(near - far).max() / scale) if scale else 0.0
 
 
-def covariance_matrix(signatures, variance_keep=0.999, form="pinv"):
+def covariance_matrix(signatures, variance_keep=0.999, form="pinv", rcond=None):
     """Fit the covariance of `signatures` and return the requested inverse form.
 
     Parameters
@@ -365,7 +390,7 @@ def covariance_matrix(signatures, variance_keep=0.999, form="pinv"):
         raise ValueError("form must be one of {0}, got {1!r}".format(list(FORMS), form))
 
     values, right, n_rows = spectrum(signatures)
-    rank = retained_rank(values, variance_keep)
+    rank = retained_rank(values, variance_keep, rcond)
 
     # Sigma = V diag(s**2 / n) V.T, so the two forms differ only in this exponent.
     if form == "pinv":
@@ -383,6 +408,8 @@ def covariance_matrix(signatures, variance_keep=0.999, form="pinv"):
         "dimension": int(signatures.shape[1]),
         "n_intervals": int(n_rows),
         "rank": int(rank),
+        "rank_rule": "rcond {0:g}".format(rcond) if rcond is not None
+                     else "variance_keep {0}".format(variance_keep),
         "variance_retained": energy,
         "condition_number": float(values[0] / values[rank - 1]),
     }
@@ -394,7 +421,7 @@ def covariance_matrix(signatures, variance_keep=0.999, form="pinv"):
 
 def create_covariance(corpus, output_path=None, variance_keep=0.999, form="pinv",
                       diagnostics_path=None, subspace_path=None, factored=False,
-                      show_progress=False):
+                      rcond=None, show_progress=False):
     """Fit the metric for one corpus and write it as a CSV matrix.
 
     The CSV carries the signature term names as both its header and its index, so the matrix
@@ -408,7 +435,8 @@ def create_covariance(corpus, output_path=None, variance_keep=0.999, form="pinv"
     frame = read_corpus(corpus)
     signatures, columns = signature_matrix(frame, show_progress=show_progress)
 
-    matrix, info = covariance_matrix(signatures, variance_keep=variance_keep, form=form)
+    matrix, info = covariance_matrix(signatures, variance_keep=variance_keep, form=form,
+                                     rcond=rcond)
     labelled = pd.DataFrame(matrix, index=columns, columns=columns)
     labelled.index.name = "term"
 
