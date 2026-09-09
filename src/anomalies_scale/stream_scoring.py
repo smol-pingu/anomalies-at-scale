@@ -139,6 +139,12 @@ class StreamScorer:
                                    else float(subspace_threshold))
         self.n_queries = 0
         self.n_off_manifold = 0
+        #: Every rho the test computed, in query order. The boolean alone is close to useless
+        #: when the corpus has fewer rows than the signature has terms - the row space cannot
+        #: span the space, so rho > 0 for every query whatever the data looks like. The
+        #: distribution is what separates a corpus that does not cover the test set from one
+        #: that merely has fewer rows than dimensions.
+        self.rho_values = []
 
         if self.off_manifold_enabled and self.index.raw is None:
             raise ValueError(
@@ -246,7 +252,8 @@ class StreamScorer:
         if self.off_manifold_enabled:
             # The same neighbour the distance was taken from, so the residual test is asked
             # about the match actually being reported rather than a nearer one that was not.
-            outside, _ = self.off_manifold(raw, np.asarray(neighbours)[0, -1])
+            outside, rho = self.off_manifold(raw, np.asarray(neighbours)[0, -1])
+            self.rho_values.append(rho)
             if outside:
                 # Infinite, not merely large. The point is not far from the corpus within the
                 # space the corpus describes - it is outside that space, and any finite number
@@ -432,34 +439,54 @@ def score_streams(streams, index, covariance, threshold, normaliser=None, trunc=
                 scorer.n_off_manifold, scorer.n_queries,
                 scorer.n_off_manifold / max(scorer.n_queries, 1)))
 
+    # Built whether or not it is written. A caller in a notebook has no use for a JSON file
+    # but every use for the counts, and `run_bagged` needs the off-manifold rate per draw -
+    # so the stats ride back on the frame's `.attrs` and `stats_path` only decides whether
+    # they are also persisted.
+    from anomalies_scale.throughput import peak_memory_bytes
+
+    queries = np.asarray(per_stream_queries, dtype=float)
+    rho = np.asarray(scorer.rho_values, dtype=float)
+    stats = {
+        "n_streams": int(len(frame)),
+        # Points the scorer traversed. Under windowing this exceeds the observation count
+        # the metrics are measured over, because adjacent windows share a boundary point -
+        # 21,866 against 20,631 on FD001, about 6%.
+        "n_points": int(n_points),
+        "peak_rss_bytes": peak_memory_bytes(),
+        "n_queries": int(scorer.n_queries),
+        "n_off_manifold": int(scorer.n_off_manifold),
+        "reference_size": int(scorer.index.reference_size),
+        "dimension": int(scorer.index.dimension),
+        "neighbours": int(scorer.neighbours),
+        "seconds": round(time.time() - started, 3),
+        # The shape of the per-stream cost, since the mean hides it.
+        "queries_per_stream": {
+            "min": int(queries.min()) if queries.size else 0,
+            "median": float(np.median(queries)) if queries.size else 0.0,
+            "mean": float(queries.mean()) if queries.size else 0.0,
+            "p90": float(np.percentile(queries, 90)) if queries.size else 0.0,
+            "max": int(queries.max()) if queries.size else 0,
+        },
+    }
+    if rho.size:
+        # The distribution, because the boolean is not informative on its own: when the corpus
+        # has fewer rows than the signature has terms its row space cannot span the space, and
+        # every query is then off-manifold by construction rather than by being unusual.
+        stats["rho"] = {
+            "n": int(rho.size),
+            "min": float(rho.min()),
+            "p05": float(np.percentile(rho, 5)),
+            "median": float(np.median(rho)),
+            "p95": float(np.percentile(rho, 95)),
+            "max": float(rho.max()),
+            "mean": float(rho.mean()),
+        }
+    out.attrs["scoring_stats"] = stats
+
     if stats_path is not None:
         import json
 
-        from anomalies_scale.throughput import peak_memory_bytes
-
-        queries = np.asarray(per_stream_queries, dtype=float)
-        stats = {
-            "n_streams": int(len(frame)),
-            # Points the scorer traversed. Under windowing this exceeds the observation count
-            # the metrics are measured over, because adjacent windows share a boundary point -
-            # 21,866 against 20,631 on FD001, about 6%.
-            "n_points": int(n_points),
-            "peak_rss_bytes": peak_memory_bytes(),
-            "n_queries": int(scorer.n_queries),
-            "n_off_manifold": int(scorer.n_off_manifold),
-            "reference_size": int(scorer.index.reference_size),
-            "dimension": int(scorer.index.dimension),
-            "neighbours": int(scorer.neighbours),
-            "seconds": round(time.time() - started, 3),
-            # The shape of the per-stream cost, since the mean hides it.
-            "queries_per_stream": {
-                "min": int(queries.min()) if queries.size else 0,
-                "median": float(np.median(queries)) if queries.size else 0.0,
-                "mean": float(queries.mean()) if queries.size else 0.0,
-                "p90": float(np.percentile(queries, 90)) if queries.size else 0.0,
-                "max": int(queries.max()) if queries.size else 0,
-            },
-        }
         stats_path = Path(stats_path)
         stats_path.parent.mkdir(parents=True, exist_ok=True)
         stats_path.write_text(json.dumps(stats, indent=2), encoding="utf-8")
