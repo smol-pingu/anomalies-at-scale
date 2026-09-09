@@ -161,10 +161,18 @@ def fit_normaliser(frame, method="zscore", width=None):
             Divide by the largest absolute value. Bounds every term to [-1, 1] without
             assuming the corpus is roughly symmetric about its mean.
         ``'factorial'``
-            Divide each level-*d* term by ``d!``, the classical signature rescaling. Corrects
-            the systematic decay of deep terms analytically rather than empirically, so it
-            needs no corpus statistics and is unaffected by a small or skewed corpus - but it
-            does nothing about channels being on different scales. Requires `width`.
+            Multiply each level-*d* term by ``d!``, the classical signature rescaling. For a
+            path of length *L* the level-*d* term is bounded by ``L**d / d!``, so multiplying by
+            ``d!`` is what brings every level to a comparable size. This follows Kidger's
+            ``rescale_signature`` - sktime's ``rescaling="post"`` - which is the reference
+            convention; an earlier version of this function divided instead, which pushed the
+            levels further apart rather than together.
+
+            It is the dilation action on the tensor algebra, so it respects the grading and
+            leaves the shuffle relations between terms intact, where the empirical methods
+            above treat the terms as free coordinates and do not. It needs no corpus statistics
+            and so is unaffected by a small or skewed corpus - but it does nothing about
+            channels being on different scales. Requires `width`.
     width : int, optional
         Path channel count, needed only by ``'factorial'`` to work out which level each term
         belongs to.
@@ -191,8 +199,11 @@ def fit_normaliser(frame, method="zscore", width=None):
             raise ValueError("method='factorial' needs `width`, the path's channel count")
         levels = term_levels(len(columns), int(width))
         centre = np.zeros(len(columns))
-        scale = np.array([float(math.factorial(int(d))) for d in levels])
-        params = {"width": int(width), "levels": levels.tolist()}
+        # `transform` divides by `scale`, so the reciprocal is what multiplies a level-d term
+        # by d! - and `inverse_transform`, which multiplies by `scale`, still undoes it.
+        scale = np.array([1.0 / math.factorial(int(d)) for d in levels])
+        params = {"width": int(width), "levels": levels.tolist(),
+                  "convention": "multiply level d by d! (sktime rescaling='post')"}
         return Normaliser(columns, centre, scale, method, params)
 
     if method == "maxabs":
