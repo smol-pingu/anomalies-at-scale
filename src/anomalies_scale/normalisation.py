@@ -163,10 +163,15 @@ def fit_normaliser(frame, method="zscore", width=None):
         ``'factorial'``
             Multiply each level-*d* term by ``d!``, the classical signature rescaling. For a
             path of length *L* the level-*d* term is bounded by ``L**d / d!``, so multiplying by
-            ``d!`` is what brings every level to a comparable size. This follows Kidger's
-            ``rescale_signature`` - sktime's ``rescaling="post"`` - which is the reference
-            convention; an earlier version of this function divided instead, which pushed the
-            levels further apart rather than together.
+            ``d!`` is what brings every level to a comparable size.
+
+            The direction is chosen to stay inline with SigMahaKNN, which is the method this
+            detector is measured against: a metric fitted to differently-scaled terms is not
+            comparable with one fitted to theirs, so matching the convention is what makes the
+            comparison mean anything. It is the same convention as Kidger's
+            ``rescale_signature`` and sktime's ``rescaling="post"``. An earlier version of this
+            function divided instead, which pushed the levels further apart rather than
+            together.
 
             It is the dilation action on the tensor algebra, so it respects the grading and
             leaves the shuffle relations between terms intact, where the empirical methods
@@ -203,7 +208,7 @@ def fit_normaliser(frame, method="zscore", width=None):
         # by d! - and `inverse_transform`, which multiplies by `scale`, still undoes it.
         scale = np.array([1.0 / math.factorial(int(d)) for d in levels])
         params = {"width": int(width), "levels": levels.tolist(),
-                  "convention": "multiply level d by d! (sktime rescaling='post')"}
+                  "convention": "multiply level d by d! (SigMahaKNN; sktime rescaling='post')"}
         return Normaliser(columns, centre, scale, method, params)
 
     if method == "maxabs":
