@@ -883,6 +883,7 @@ rule covariance:
             apply_normaliser(input.corpus, input.get("normaliser")),
             output_path=output.covariance,
             variance_keep=config["metric"]["variance_keep"],
+            rcond=config["metric"].get("rcond"),
             form=config["metric"]["form"],
             diagnostics_path=output.diagnostics,
             subspace_path=output.subspace,
@@ -1159,6 +1160,9 @@ rule bagged:
             trunc=config["signature"]["trunc"],
             granularity=config["signature"]["granularity"],
             variance_keep=config["metric"]["variance_keep"],
+            rcond=config["metric"].get("rcond"),
+            normalise=(config["signature"]["normalise_method"]
+                       if config["signature"].get("normalise") else None),
             band=config["detect"]["band"],
             folds=config["calibrate"]["folds"],
             statistic=config["calibrate"]["statistic"],
