@@ -108,12 +108,31 @@ def mask_to_intervals(mask):
 
 def one_draw(corpus_streams, test_streams, columns, trunc, granularity, variance_keep,
              band, folds, statistic, random_state, span, sig_tol, tol, neighbours,
-             detector, forest_settings):
+             detector, forest_settings, normalise=None, rcond=None, off_manifold=None):
     """Build, calibrate and run one detector on one channel subset.
 
     Everything is in memory. A draw's corpus, metric and index are meaningless to any other
     draw - different channels, different terms, a different whitened space - so persisting them
     would cost disk for artifacts nothing can reuse.
+
+    `normalise` names a method from :mod:`anomalies_scale.normalisation`, or None to leave the
+    terms in their own units. It matters more here than the default of None suggests. A level-k
+    term scales like the increment to the k-th power, so on data whose channels span orders of
+    magnitude the corpus concentrates its variance in a handful of level-2 terms, and
+    `variance_keep` then retains a handful of directions - measured at rank 2 to 5 of 2,450 on
+    Exathlon, which is not a metric so much as a projection onto noise. C-MAPSS does not need it
+    and the pipeline default is off, so this stays opt-in rather than becoming a silent change
+    to every existing run.
+
+    `off_manifold` arms SigMahaKNN's residual test at that value of ``rho``. It needs the
+    corpus vectors as they were before whitening, so the index keeps a second copy of them -
+    which is why it is opt-in rather than always on. Note what it can and cannot do here: the
+    test only ever turns a finite score into an infinite one, so it adds flags and never
+    removes them, and on a draw that already flags most points it cannot improve precision.
+    What it produces that is worth having is the distribution of ``rho`` itself, returned in
+    the diagnostics - and that has to be read against the corpus's own shape, because a draw
+    with fewer intervals than terms has a row space that cannot span the term space and will
+    report every query off-manifold whatever the data does.
     """
     import faiss
 
@@ -121,11 +140,32 @@ def one_draw(corpus_streams, test_streams, columns, trunc, granularity, variance
 
     corpus = compute_corpus(restrict_channels(corpus_streams, columns),
                             trunc=trunc, granularity=granularity)
+
+    normaliser = None
+    if normalise:
+        from anomalies_scale.normalisation import fit_normaliser
+
+        normaliser = fit_normaliser(corpus, method=normalise, width=len(columns) + 1)
+        corpus = normaliser.transform(corpus)
+
     signatures, terms = signature_matrix(corpus)
     depths = corpus["depth"].to_numpy(dtype=int)
     streams = np.asarray([source_of(name) for name in corpus[STREAM_COLUMN].to_numpy()])
 
-    matrix, info = covariance_matrix(signatures, variance_keep=variance_keep, form="inv_sqrt")
+    subspace = None
+    if off_manifold is not None:
+        if detector == "isolation_forest":
+            raise ValueError(
+                "the off-manifold test needs the corpus vectors before whitening and a "
+                "nearest-neighbour match to difference against; a forest keeps neither")
+        from anomalies_scale.covariance_creation import numerical_subspace
+
+        # The *numerically* non-zero row space, not the one `variance_keep` retains - the two
+        # answer different questions and `numerical_subspace` says why.
+        subspace = numerical_subspace(signatures)
+
+    matrix, info = covariance_matrix(signatures, variance_keep=variance_keep,
+                                     form="inv_sqrt", rcond=rcond)
     # The factor rides along on the diagnostics. A draw is already a small problem - 42 terms at
     # 5 channels - so the latent projection saves little here, but using it keeps every detector
     # in the pipeline reaching its space the same way.
@@ -158,19 +198,43 @@ def one_draw(corpus_streams, test_streams, columns, trunc, granularity, variance
         index = faiss.IndexFlatL2(whitened.shape[1])
         index.add(whitened)
         engine = PooledIndex(index, depth=depths, split=np.zeros(len(depths), dtype=int),
-                             band=band, terms=terms)
+                             band=band, terms=terms,
+                             # Normalised but unwhitened, matching what `StreamScorer.signature`
+                             # hands the test - `Sigma^-1/2` destroys the component it looks for.
+                             raw=signatures if subspace is not None else None)
 
+    # The normaliser goes with the metric: the index lives in normalised units, so a query that
+    # skipped it would be measured in a space the reference set does not occupy.
     scored = score_streams(restrict_channels(test_streams, columns), engine, metric,
                            threshold=thresholds, span=span, sig_tol=sig_tol, tol=tol,
-                           neighbours=neighbours, show_progress=False)
-    return scored, {"terms": int(signatures.shape[1]), "rank": int(info["rank"]),
-                    "intervals": int(len(corpus))}
+                           neighbours=neighbours, normaliser=normaliser,
+                           subspace=subspace, subspace_threshold=off_manifold,
+                           show_progress=False)
+
+    diagnostics = {"terms": int(signatures.shape[1]), "rank": int(info["rank"]),
+                   "intervals": int(len(corpus)), "normalised": bool(normalise)}
+    if subspace is not None:
+        stats = scored.attrs.get("scoring_stats", {})
+        queries = max(int(stats.get("n_queries", 0)), 1)
+        diagnostics.update({
+            "row_space_rank": int(subspace.shape[0]),
+            # Below 1 the row space cannot span the term space, and rho is then bounded away
+            # from zero for every query however ordinary it is.
+            "row_space_ratio": float(subspace.shape[0]) / float(signatures.shape[1]),
+            "n_off_manifold": int(stats.get("n_off_manifold", 0)),
+            "off_manifold_rate": int(stats.get("n_off_manifold", 0)) / queries,
+            "rho_median": float(stats.get("rho", {}).get("median", float("nan"))),
+            "rho_p05": float(stats.get("rho", {}).get("p05", float("nan"))),
+            "rho_p95": float(stats.get("rho", {}).get("p95", float("nan"))),
+        })
+    return scored, diagnostics
 
 
 def run_bagged(corpus_streams, test_streams, draws=30, features=None, votes=1,
                trunc=2, granularity=3, variance_keep=0.999, band=1, folds=5, statistic="p95",
                random_state=0, span=None, sig_tol=2, tol=0, neighbours=1,
-               detector="mahalanobis", forest_settings=None, output_path=None,
+               detector="mahalanobis", forest_settings=None, normalise=None, rcond=None,
+               off_manifold=None, output_path=None,
                scores_path=None, diagnostics_path=None, show_progress=False):
     """Every draw, aggregated into one verdict per point.
 
@@ -202,7 +266,7 @@ def run_bagged(corpus_streams, test_streams, draws=30, features=None, votes=1,
         scored, info = one_draw(corpus_streams, test_streams, columns, trunc, granularity,
                                 variance_keep, band, folds, statistic,
                                 random_state + number, span, sig_tol, tol, neighbours,
-                                detector, forest_settings)
+                                detector, forest_settings, normalise, rcond, off_manifold)
 
         flagged = 0
         for row in scored.itertuples(index=False):
